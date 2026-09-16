@@ -5,11 +5,17 @@ use super::{
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
-    base::{CFRelease, TCFType, kCFAllocatorDefault},
+    array::{
+        CFArrayAppendValue, CFArrayCreateMutable, CFArrayCreateMutableCopy, CFArrayGetTypeID,
+        kCFTypeArrayCallBacks,
+    },
+    base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType, kCFAllocatorDefault},
     date::CFTimeInterval,
+    dictionary::CFDictionary,
+    number::CFNumber,
     number::{CFBooleanRef, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, CFRunLoopSourceRef, kCFRunLoopCommonModes},
-    string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+    string::{CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
 };
 use core_graphics::{
     base::{CGError, CGFloat, kCGErrorSuccess},
@@ -165,6 +171,146 @@ fn capture_anchor(
     Some((f64::from(anchor.0), f64::from(anchor.1)))
 }
 
+const HID_USAGE_CAPS_LOCK: i64 = 0x0000_0007_0000_0039;
+const HID_USAGE_F18: i64 = 0x0000_0007_0000_006d;
+
+/// Temporarily replaces the system's Caps Lock HID usage while control is on
+/// a peer. macOS implements “Caps Lock to switch input sources” below Quartz,
+/// so dropping a CGEvent cannot stop that action. A HID usage remap can.
+///
+/// The complete pre-existing `UserKeyMapping` value is retained and restored;
+/// Mousehop never leaves a permanent keyboard preference behind.
+#[derive(Default)]
+struct CapsLockRemap {
+    client: usize,
+    original_mapping: usize,
+    enabled: bool,
+}
+
+impl std::fmt::Debug for CapsLockRemap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapsLockRemap")
+            .field("enabled", &self.enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CapsLockRemap {
+    fn enable(&mut self) -> Result<(), &'static str> {
+        if self.enabled {
+            return Ok(());
+        }
+
+        if self.client == 0 {
+            self.client =
+                unsafe { IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault) } as usize;
+            if self.client == 0 {
+                return Err("IOHIDEventSystemClientCreateSimpleClient returned null");
+            }
+        }
+
+        let property_key = CFString::new("UserKeyMapping");
+        let original = unsafe {
+            IOHIDEventSystemClientCopyProperty(
+                self.client as *mut c_void,
+                property_key.as_concrete_TypeRef(),
+            )
+        };
+        let mapping_array = unsafe {
+            if !original.is_null() && CFGetTypeID(original) == CFArrayGetTypeID() {
+                CFArrayCreateMutableCopy(kCFAllocatorDefault, 0, original.cast())
+            } else {
+                CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks)
+            }
+        };
+        if mapping_array.is_null() {
+            if !original.is_null() {
+                unsafe { CFRelease(original) };
+            }
+            return Err("could not create temporary UserKeyMapping array");
+        }
+
+        let source_key = CFString::new("HIDKeyboardModifierMappingSrc");
+        let destination_key = CFString::new("HIDKeyboardModifierMappingDst");
+        let source = CFNumber::from(HID_USAGE_CAPS_LOCK);
+        let destination = CFNumber::from(HID_USAGE_F18);
+        let mapping = CFDictionary::from_CFType_pairs(&[
+            (source_key, source),
+            (destination_key, destination),
+        ]);
+        unsafe { CFArrayAppendValue(mapping_array, mapping.as_CFTypeRef()) };
+
+        let applied = unsafe {
+            IOHIDEventSystemClientSetProperty(
+                self.client as *mut c_void,
+                property_key.as_concrete_TypeRef(),
+                mapping_array.cast(),
+            )
+        };
+        unsafe { CFRelease(mapping_array.cast()) };
+        if !applied {
+            if !original.is_null() {
+                unsafe { CFRelease(original) };
+            }
+            return Err("IOHIDEventSystemClientSetProperty rejected UserKeyMapping");
+        }
+
+        self.original_mapping = original as usize;
+        self.enabled = true;
+        log::debug!("temporarily remapped physical Caps Lock to F18");
+        Ok(())
+    }
+
+    fn disable(&mut self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let property_key = CFString::new("UserKeyMapping");
+        let empty_mapping =
+            unsafe { CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks) };
+        if empty_mapping.is_null() {
+            return Err("could not create empty UserKeyMapping array");
+        }
+        let value = if self.original_mapping == 0 {
+            empty_mapping.cast()
+        } else {
+            self.original_mapping as CFTypeRef
+        };
+        let restored = unsafe {
+            IOHIDEventSystemClientSetProperty(
+                self.client as *mut c_void,
+                property_key.as_concrete_TypeRef(),
+                value,
+            )
+        };
+        unsafe { CFRelease(empty_mapping.cast()) };
+        if !restored {
+            return Err("IOHIDEventSystemClientSetProperty could not restore UserKeyMapping");
+        }
+
+        if self.original_mapping != 0 {
+            unsafe { CFRelease(self.original_mapping as CFTypeRef) };
+            self.original_mapping = 0;
+        }
+        self.enabled = false;
+        log::debug!("restored the original Caps Lock HID mapping");
+        Ok(())
+    }
+}
+
+impl Drop for CapsLockRemap {
+    fn drop(&mut self) {
+        if let Err(error) = self.disable() {
+            log::error!("failed to restore Caps Lock HID mapping during shutdown: {error}");
+        }
+        if self.client != 0 {
+            unsafe { CFRelease(self.client as CFTypeRef) };
+        }
+    }
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -189,6 +335,10 @@ struct InputCaptureState {
     /// between the callback's direct `Begin` channel and the producer's later
     /// `AutoRelease` lifecycle event.
     tap_recovery_pending: Option<TapRecovery>,
+    /// While input belongs to a peer, remap physical Caps Lock below the
+    /// login-session input-source handler. The callback translates the mapped
+    /// key back to Caps Lock for the wire and drops it locally.
+    caps_lock_remap: CapsLockRemap,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
@@ -322,6 +472,7 @@ impl InputCaptureState {
             cursor_hidden: false,
             tap_recovery_generation: 0,
             tap_recovery_pending: None,
+            caps_lock_remap: CapsLockRemap::default(),
             enter_position: None,
             bounds: Bounds::default(),
             display_layout: DisplayLayout::default(),
@@ -331,11 +482,18 @@ impl InputCaptureState {
     }
 
     fn begin_event_tap_recovery(&mut self) -> ProducerEvent {
+        self.restore_caps_lock_mapping("event-tap recovery");
         event_tap_disabled_transition(
             &mut self.current_pos,
             &mut self.tap_recovery_generation,
             &mut self.tap_recovery_pending,
         )
+    }
+
+    fn restore_caps_lock_mapping(&mut self, context: &str) {
+        if let Err(error) = self.caps_lock_remap.disable() {
+            log::error!("failed to restore Caps Lock HID mapping during {context}: {error}");
+        }
     }
 
     fn crossed(&mut self, event: &CGEvent) -> Option<Position> {
@@ -463,6 +621,7 @@ impl InputCaptureState {
                     "[release-warp] handle_producer_event Release: current_pos={:?} warp_target={warp_target:?}",
                     self.current_pos
                 );
+                self.restore_caps_lock_mapping("capture release");
                 if self.current_pos.take().is_some() {
                     // We hold the callback's state mutex for this whole
                     // transition, so clearing ownership first prevents any
@@ -495,7 +654,15 @@ impl InputCaptureState {
                     // cursor or restore capture ownership.
                     log::debug!("discarding queued Grab({pos:?}) during CGEventTap recovery");
                 } else if self.current_pos.is_none() {
-                    self.hide_cursor()?;
+                    if let Err(error) = self.caps_lock_remap.enable() {
+                        log::error!(
+                            "failed to isolate Caps Lock from the local input source: {error}"
+                        );
+                    }
+                    if let Err(error) = self.hide_cursor() {
+                        self.restore_caps_lock_mapping("failed capture grab");
+                        return Err(error);
+                    }
                     self.current_pos = Some(pos);
                 }
             }
@@ -506,6 +673,7 @@ impl InputCaptureState {
                 self.active_clients.remove(&p);
                 self.crossing_modifiers.remove(&p);
                 if self.current_pos == Some(p) {
+                    self.restore_caps_lock_mapping("client destruction");
                     self.current_pos = None;
                     self.show_cursor()?;
                 }
@@ -762,10 +930,13 @@ fn modifier_key_states(key: u32, flags: CGEventFlags) -> ([u8; 2], usize) {
     }
 }
 
+const MACOS_F18_KEYCODE: i64 = 0x4f;
+
 fn get_events(
     ev_type: &CGEventType,
     ev: &CGEvent,
     result: &mut Vec<CaptureEvent>,
+    caps_lock_remapped: bool,
 ) -> Result<(), CaptureError> {
     fn map_pointer_event(ev: &CGEvent) -> PointerEvent {
         PointerEvent::Motion {
@@ -775,8 +946,11 @@ fn get_events(
         }
     }
 
-    fn map_key(ev: &CGEvent) -> Result<u32, CaptureError> {
+    fn map_key(ev: &CGEvent, caps_lock_remapped: bool) -> Result<u32, CaptureError> {
         let code = ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+        if caps_lock_remapped && code == MACOS_F18_KEYCODE {
+            return Ok(scancode::Linux::KeyCapsLock as u32);
+        }
         match KeyMap::from_key_mapping(KeyMapping::Mac(code as u16)) {
             Ok(k) => Ok(k.evdev as u32),
             Err(()) => Err(CaptureError::KeyMapError(code)),
@@ -795,7 +969,7 @@ fn get_events(
             if ev.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
                 return Ok(());
             }
-            let k = map_key(ev)?;
+            let k = map_key(ev, caps_lock_remapped)?;
             result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
                 key: k,
@@ -803,7 +977,7 @@ fn get_events(
             })));
         }
         CGEventType::KeyUp => {
-            let k = map_key(ev)?;
+            let k = map_key(ev, caps_lock_remapped)?;
             result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
                 key: k,
@@ -814,11 +988,7 @@ fn get_events(
             let cg_flags = ev.get_flags();
             let (depressed, mods_locked) = modifier_masks(cg_flags);
 
-            if let Ok(key) = map_key(ev) {
-                // macOS emits one FlagsChanged event per Caps Lock toggle,
-                // not separate physical down/up events. `modifier_key_states`
-                // returns an atomic tap for Caps on both toggle-on and
-                // toggle-off; standard modifiers return their one live phase.
+            if let Ok(key) = map_key(ev, caps_lock_remapped) {
                 let (states, count) = modifier_key_states(key, cg_flags);
                 result.extend(states[..count].iter().map(|&state| {
                     CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
@@ -1129,9 +1299,12 @@ fn create_event_tap<'a>(
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
-            get_events(&event_type, cg_ev, &mut res_events).unwrap_or_else(|e| {
-                log::error!("Failed to get events: {e}");
-            });
+            let caps_lock_remapped = state.caps_lock_remap.enabled;
+            get_events(&event_type, cg_ev, &mut res_events, caps_lock_remapped).unwrap_or_else(
+                |e| {
+                    log::error!("Failed to get events: {e}");
+                },
+            );
 
             // Keep (hidden) cursor at the edge of the screen
             if matches!(
@@ -2100,6 +2273,16 @@ mod modifier_tests {
     }
 
     #[test]
+    #[ignore = "temporarily changes the system HID key mapping"]
+    fn caps_lock_hid_remap_round_trips_the_system_property() {
+        let mut remap = CapsLockRemap::default();
+        remap.enable().expect("apply temporary Caps Lock mapping");
+        assert!(remap.enabled);
+        remap.disable().expect("restore original key mapping");
+        assert!(!remap.enabled);
+    }
+
+    #[test]
     fn standard_modifier_still_emits_one_phase() {
         assert_eq!(
             modifier_key_states(KeyLeftCtrl as u32, flags(NX_DEVICE_LCTRL_KEY_MASK),),
@@ -2209,6 +2392,7 @@ mod modifier_tests {
             cursor_hidden: true,
             tap_recovery_generation: 0,
             tap_recovery_pending: None,
+            caps_lock_remap: CapsLockRemap::default(),
             enter_position: Some(CGPoint {
                 x: 1919.0,
                 y: 900.0,
@@ -2415,6 +2599,17 @@ extern "C" {
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
+    /// The same event-system property API used by Apple's `hidutil`. It acts
+    /// below Quartz and can therefore neutralize the special Caps Lock input
+    /// source action while control belongs to a peer.
+    fn IOHIDEventSystemClientCreateSimpleClient(allocator: *const c_void) -> *mut c_void;
+    fn IOHIDEventSystemClientCopyProperty(client: *mut c_void, key: CFStringRef) -> CFTypeRef;
+    fn IOHIDEventSystemClientSetProperty(
+        client: *mut c_void,
+        key: CFStringRef,
+        value: CFTypeRef,
+    ) -> bool;
+
     /// Register the calling process for system-power notifications.
     /// Returns the `io_connect_t` root power port (used later in
     /// `IOAllowPowerChange` to ack sleep-related messages) and writes

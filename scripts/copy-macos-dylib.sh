@@ -172,6 +172,16 @@ if [ -f "$resources_path/_up_/target/menubar-template.png" ]; then
   rmdir "$resources_path/_up_/target" "$resources_path/_up_" 2>/dev/null || true
 fi
 
+# cargo-bundle silently skips paths that do not resolve from its working
+# directory. Refuse to finish a distributable bundle without either icon so a
+# packaging invocation cannot ship an iconless app again.
+for required_resource in icon.icns menubar-template.png; do
+  if [ ! -f "$resources_path/$required_resource" ]; then
+    echo "Missing required macOS bundle resource: $resources_path/$required_resource" >&2
+    exit 1
+  fi
+done
+
 # Ensure the main executable has our Frameworks path in its RPATH
 if ! otool -l "$exec_path" | grep -q "@executable_path/../Frameworks"; then
   echo "Adding RPATH to $exec_path"

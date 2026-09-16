@@ -35,6 +35,50 @@ the standardized event format.
 The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client.
 
+### macOS Caps Lock
+
+Quartz-injected Caps Lock events do not reliably enter the hardware-only path
+that macOS uses for its “Caps Lock to switch input sources” setting. They can
+toggle the uppercase latch instead, or change the active input method without
+refreshing the menu-bar indicator.
+
+When macOS receives a complete remote Caps Lock press from Windows, Mousehop
+therefore consumes the down/up pair and switches through Text Input Source
+Services on release. A non-Latin input source switches to macOS's most recently
+used ASCII-capable source; the next press returns to the most recently observed
+non-ASCII source. When Mousehop starts while a Latin source is active, it reads
+macOS's input-source history to recover the previously used non-Latin source;
+it does not choose the first non-Latin source from the enabled list. Since
+Mousehop never injects AlphaShift for this path, a
+remote tap cannot accidentally enable continuous uppercase typing. Carbon's
+input-source selection updates the system input source and its menu-bar state
+together. This uses the existing keyboard protocol.
+
+Manual regression check: with ABC and a Chinese input method enabled on the
+Mac, control it from Windows and press/release Caps Lock repeatedly. After each
+press, verify both typed characters and the menu-bar input-source icon. Also
+verify that holding Caps Lock does not start key repeat and that crossing or
+disconnecting with Caps Lock released does not trigger an extra switch.
+
+When macOS controls a remote peer, Mousehop temporarily adds a system HID usage
+mapping from physical Caps Lock to F18. macOS implements “Caps Lock to switch
+input sources” below the Quartz event-tap interception point, so dropping the
+Quartz event alone cannot suppress it. The mapped F18 bypasses that handler;
+Mousehop translates it back to Caps Lock only on the wire and drops it locally.
+The complete pre-existing `UserKeyMapping` property is restored when capture
+returns, the client disconnects, the event tap is interrupted, or Mousehop
+shuts down. The Windows sink treats Caps Lock as a discrete lock key and never
+starts its synthetic repeat timer for it. This makes the Windows lock state
+toggle once per press while the Mac's input source and uppercase state remain
+unchanged.
+
+Manual regression check: set the Mac's Caps Lock action first to the normal
+uppercase latch and then to input-source switching. In each mode, move capture
+to Windows and press Caps Lock repeatedly, including short taps and long holds.
+Verify that Windows toggles uppercase once per press, the Mac menu-bar input
+source icon does not move, and returning the pointer to the Mac does not reveal
+a changed local uppercase state.
+
 
 ## Requests
 
@@ -74,4 +118,3 @@ This ensures that
 - a) Events can never result in a feedback loop.
 - b) As soon as a virtual input enters another client, mousehop will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
-

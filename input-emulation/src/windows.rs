@@ -118,11 +118,18 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
-                    match state {
-                        // pressed
-                        0 => self.kill_repeat_task(),
-                        1 => self.spawn_repeat_task(key).await,
-                        _ => {}
+                    if key == scancode::Linux::KeyCapsLock as u32 {
+                        // Lock keys are discrete toggles. Never synthesize
+                        // repeats: delayed release delivery must not flip the
+                        // Windows lock state more than once.
+                        self.kill_repeat_task();
+                    } else {
+                        match state {
+                            // pressed
+                            0 => self.kill_repeat_task(),
+                            1 => self.spawn_repeat_task(key).await,
+                            _ => {}
+                        }
                     }
                     key_event(key, state)
                 }

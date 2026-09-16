@@ -1,9 +1,21 @@
 use super::{Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
-use core_foundation::base::{CFRelease, kCFAllocatorDefault};
-use core_foundation::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
-use core_foundation_sys::number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type};
+use core_foundation::base::{CFRelease, TCFType, kCFAllocatorDefault};
+use core_foundation::string::{
+    CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8,
+};
+use core_foundation_sys::array::{
+    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef,
+};
+use core_foundation_sys::base::{Boolean, CFGetTypeID, CFTypeRef, OSStatus};
+use core_foundation_sys::dictionary::{
+    CFDictionaryGetTypeID, CFDictionaryGetValue, CFDictionaryRef,
+};
+use core_foundation_sys::number::{
+    CFBooleanGetValue, CFBooleanRef, CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type,
+};
+use core_foundation_sys::string::CFStringGetTypeID;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{CGDisplay, CGPoint};
 use core_graphics::event::{
@@ -19,6 +31,7 @@ use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::ptr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -124,6 +137,16 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
+    /// A Windows keyboard reports Caps Lock as an ordinary down/up pair. Keep
+    /// the physical phase so one completed press switches input source once.
+    caps_lock_pressed: bool,
+    /// Most recently observed non-ASCII input source. This mirrors macOS's
+    /// "switch to and from the last used Latin input source" behavior while
+    /// retaining the user's non-Latin side of the pair.
+    last_non_ascii_input_source: Option<String>,
+    /// Whether this Mac has an enabled non-ASCII input source. Without one,
+    /// preserve ordinary Caps Lock behavior instead of swallowing the key.
+    caps_lock_input_source_mode: bool,
     /// Exact physical source keys behind the aggregate modifier mask. macOS
     /// exposes left/right key codes independently, so releasing one side must
     /// not clear Shift/Control/Option/Command while its peer remains held.
@@ -217,10 +240,52 @@ impl MacOSEmulation {
             repeat_task: None,
             repeat_key: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            caps_lock_pressed: false,
+            last_non_ascii_input_source: current_non_ascii_input_source_id(),
+            caps_lock_input_source_mode: has_non_ascii_input_source(),
             physical_modifiers: Cell::new(PhysicalModifiers::empty()),
             user_activity_assertion: Cell::new(0),
             display_union_cache: Cell::new(None),
         })
+    }
+
+    async fn handle_caps_lock(&mut self, state: u8) {
+        if !self.caps_lock_input_source_mode {
+            if state == 1 {
+                const MAC_CAPS_LOCK_KEYCODE: CGKeyCode = 0x39;
+                key_event(
+                    self.event_source.clone(),
+                    MAC_CAPS_LOCK_KEYCODE,
+                    1,
+                    self.modifier_state.get(),
+                );
+                key_event(
+                    self.event_source.clone(),
+                    MAC_CAPS_LOCK_KEYCODE,
+                    0,
+                    self.modifier_state.get(),
+                );
+                toggle_caps_lock(&self.modifier_state);
+            }
+            return;
+        }
+        if !caps_lock_press_completed(&mut self.caps_lock_pressed, state) {
+            return;
+        }
+        match switch_caps_lock_input_source(&mut self.last_non_ascii_input_source) {
+            Ok((from, to)) => {
+                // TIS selection is delivered through macOS's text-input
+                // service. Preserve wire order by waiting briefly for that
+                // service to publish the new source before accepting the next
+                // remotely typed character.
+                if wait_for_input_source(&to).await {
+                    log::debug!("Caps Lock switched input source: {from} -> {to}");
+                } else {
+                    log::warn!("Caps Lock selected {to}, but macOS did not activate it in time");
+                }
+            }
+            Err(error) => log::warn!("Caps Lock could not switch input source: {error}"),
+        }
     }
 
     /// Tell the macOS power-manager that real user input is arriving
@@ -443,6 +508,281 @@ extern "C" {
         user_type: c_int,
         out_id: *mut u32,
     ) -> i32;
+}
+
+type TISInputSourceRef = *mut c_void;
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
+    fn TISCopyCurrentASCIICapableKeyboardInputSource() -> TISInputSourceRef;
+    fn TISCreateInputSourceList(
+        properties: CFDictionaryRef,
+        include_all_installed: Boolean,
+    ) -> CFArrayRef;
+    fn TISGetInputSourceProperty(
+        input_source: TISInputSourceRef,
+        property_key: CFStringRef,
+    ) -> *const c_void;
+    fn TISSelectInputSource(input_source: TISInputSourceRef) -> OSStatus;
+
+    static kTISPropertyInputSourceID: CFStringRef;
+    static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
+    static kTISPropertyInputSourceIsSelectCapable: CFStringRef;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InputSourceDescriptor {
+    id: String,
+    ascii_capable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InputSourceHistoryKey {
+    Id(String),
+    KeyboardLayoutName(String),
+}
+
+fn input_source_descriptor(source: TISInputSourceRef) -> Option<InputSourceDescriptor> {
+    if source.is_null() {
+        return None;
+    }
+    unsafe {
+        let id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) as CFStringRef;
+        if id.is_null() {
+            return None;
+        }
+        let id = CFString::wrap_under_get_rule(id).to_string();
+        let ascii = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable)
+            as CFBooleanRef;
+        Some(InputSourceDescriptor {
+            id,
+            ascii_capable: !ascii.is_null() && CFBooleanGetValue(ascii),
+        })
+    }
+}
+
+fn input_source_is_selectable(source: TISInputSourceRef) -> bool {
+    unsafe {
+        let selectable = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable)
+            as CFBooleanRef;
+        !selectable.is_null() && CFBooleanGetValue(selectable)
+    }
+}
+
+fn with_current_input_source<T>(f: impl FnOnce(TISInputSourceRef) -> T) -> Option<T> {
+    unsafe {
+        let source = TISCopyCurrentKeyboardInputSource();
+        if source.is_null() {
+            return None;
+        }
+        let result = f(source);
+        CFRelease(source as CFTypeRef);
+        Some(result)
+    }
+}
+
+fn current_non_ascii_input_source_id() -> Option<String> {
+    with_current_input_source(input_source_descriptor)
+        .flatten()
+        .filter(|source| !source.ascii_capable)
+        .map(|source| source.id)
+}
+
+fn has_non_ascii_input_source() -> bool {
+    enabled_selectable_input_sources()
+        .is_ok_and(|sources| sources.iter().any(|source| !source.ascii_capable))
+}
+
+fn current_input_source_id() -> Option<String> {
+    with_current_input_source(input_source_descriptor)
+        .flatten()
+        .map(|source| source.id)
+}
+
+fn caps_lock_press_completed(pressed: &mut bool, state: u8) -> bool {
+    match state {
+        1 => {
+            *pressed = true;
+            false
+        }
+        0 => std::mem::take(pressed),
+        _ => false,
+    }
+}
+
+async fn wait_for_input_source(expected_id: &str) -> bool {
+    const ATTEMPTS: usize = 50;
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
+    for _ in 0..ATTEMPTS {
+        if current_input_source_id().as_deref() == Some(expected_id) {
+            return true;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    false
+}
+
+fn choose_non_ascii_input_source(
+    sources: &[InputSourceDescriptor],
+    preferred_id: Option<&str>,
+    history: &[InputSourceHistoryKey],
+) -> Option<String> {
+    let candidates = sources
+        .iter()
+        .filter(|source| !source.ascii_capable)
+        .collect::<Vec<_>>();
+    if let Some(source) =
+        preferred_id.and_then(|id| candidates.iter().find(|source| source.id == id).copied())
+    {
+        return Some(source.id.clone());
+    }
+    for entry in history {
+        let matched = candidates.iter().find(|source| match entry {
+            InputSourceHistoryKey::Id(id) => source.id == *id,
+            InputSourceHistoryKey::KeyboardLayoutName(name) => source
+                .id
+                .strip_prefix("com.apple.keylayout.")
+                .is_some_and(|suffix| suffix == name),
+        });
+        if let Some(source) = matched {
+            return Some(source.id.clone());
+        }
+    }
+    (candidates.len() == 1).then(|| candidates[0].id.clone())
+}
+
+fn cf_string(value: *const c_void) -> Option<String> {
+    if value.is_null() || unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+        return None;
+    }
+    Some(unsafe { CFString::wrap_under_get_rule(value as CFStringRef) }.to_string())
+}
+
+fn input_source_history() -> Vec<InputSourceHistoryKey> {
+    unsafe {
+        let key = CFString::new("AppleInputSourceHistory");
+        let app = CFString::new("com.apple.HIToolbox");
+        let value = CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), app.as_concrete_TypeRef());
+        if value.is_null() || CFGetTypeID(value) != CFArrayGetTypeID() {
+            if !value.is_null() {
+                CFRelease(value);
+            }
+            return Vec::new();
+        }
+
+        let input_mode_key = CFString::new("Input Mode");
+        let bundle_id_key = CFString::new("Bundle ID");
+        let layout_name_key = CFString::new("KeyboardLayout Name");
+        let list = value as CFArrayRef;
+        let mut history = Vec::new();
+        for index in 0..CFArrayGetCount(list) {
+            let entry = CFArrayGetValueAtIndex(list, index);
+            if entry.is_null() || CFGetTypeID(entry) != CFDictionaryGetTypeID() {
+                continue;
+            }
+            let dict = entry as CFDictionaryRef;
+            let exact_id = cf_string(CFDictionaryGetValue(
+                dict,
+                input_mode_key.as_concrete_TypeRef() as *const c_void,
+            ))
+            .or_else(|| {
+                cf_string(CFDictionaryGetValue(
+                    dict,
+                    bundle_id_key.as_concrete_TypeRef() as *const c_void,
+                ))
+            });
+            if let Some(id) = exact_id {
+                history.push(InputSourceHistoryKey::Id(id));
+            } else if let Some(name) = cf_string(CFDictionaryGetValue(
+                dict,
+                layout_name_key.as_concrete_TypeRef() as *const c_void,
+            )) {
+                history.push(InputSourceHistoryKey::KeyboardLayoutName(name));
+            }
+        }
+        CFRelease(value);
+        history
+    }
+}
+
+fn select_input_source_by_id(id: &str) -> Result<(), String> {
+    unsafe {
+        // `false` returns enabled sources only. Filtering select-capable
+        // entries avoids parent input methods and palettes that Carbon cannot
+        // make the active keyboard source.
+        let list = TISCreateInputSourceList(ptr::null(), false as Boolean);
+        if list.is_null() {
+            return Err("macOS returned no enabled input-source list".into());
+        }
+        let mut status = None;
+        for index in 0..CFArrayGetCount(list) {
+            let source = CFArrayGetValueAtIndex(list, index) as TISInputSourceRef;
+            if input_source_is_selectable(source)
+                && input_source_descriptor(source).is_some_and(|source| source.id == id)
+            {
+                status = Some(TISSelectInputSource(source));
+                break;
+            }
+        }
+        CFRelease(list as CFTypeRef);
+        match status {
+            Some(0) => Ok(()),
+            Some(code) => Err(format!("TISSelectInputSource failed with status {code}")),
+            None => Err(format!("input source {id} is not enabled or selectable")),
+        }
+    }
+}
+
+fn enabled_selectable_input_sources() -> Result<Vec<InputSourceDescriptor>, String> {
+    unsafe {
+        let list = TISCreateInputSourceList(ptr::null(), false as Boolean);
+        if list.is_null() {
+            return Err("macOS returned no enabled input-source list".into());
+        }
+        let mut result = Vec::new();
+        for index in 0..CFArrayGetCount(list) {
+            let source = CFArrayGetValueAtIndex(list, index) as TISInputSourceRef;
+            if input_source_is_selectable(source) {
+                if let Some(source) = input_source_descriptor(source) {
+                    result.push(source);
+                }
+            }
+        }
+        CFRelease(list as CFTypeRef);
+        Ok(result)
+    }
+}
+
+fn switch_caps_lock_input_source(
+    last_non_ascii: &mut Option<String>,
+) -> Result<(String, String), String> {
+    let current = with_current_input_source(input_source_descriptor)
+        .flatten()
+        .ok_or_else(|| "macOS returned no current keyboard input source".to_owned())?;
+
+    let target = if current.ascii_capable {
+        let sources = enabled_selectable_input_sources()?;
+        let history = input_source_history();
+        choose_non_ascii_input_source(&sources, last_non_ascii.as_deref(), &history)
+            .ok_or_else(|| "no enabled non-ASCII input source is selectable".to_owned())?
+    } else {
+        *last_non_ascii = Some(current.id.clone());
+        unsafe {
+            let source = TISCopyCurrentASCIICapableKeyboardInputSource();
+            if source.is_null() {
+                return Err("macOS returned no ASCII-capable input source".into());
+            }
+            let target = input_source_descriptor(source)
+                .map(|source| source.id)
+                .ok_or_else(|| "ASCII-capable input source has no identifier".to_owned());
+            CFRelease(source as CFTypeRef);
+            target?
+        }
+    };
+
+    select_input_source_by_id(&target)?;
+    Ok((current.id, target))
 }
 
 /// `kIOPMUserActiveLocal` — local mouse / keyboard activity (the
@@ -707,29 +1047,12 @@ impl Emulation for MacOSEmulation {
                         }
                     };
 
-                    // macOS represents Caps Lock as a toggle, while Linux
-                    // sends an ordinary down/up pair (and some compositors
-                    // include a locked Caps key in their boundary-entry
-                    // snapshot). Turn each accepted down into one complete
-                    // tap and ignore its matching up. It must never enter the
-                    // repeat task: doing so floods the guest with Caps key
-                    // downs until the connection closes.
+                    // Quartz-synthesized Caps events bypass macOS's hardware
+                    // short-press input-source path and can instead toggle the
+                    // uppercase latch. Complete the same user-visible action
+                    // through Text Input Source Services on physical release.
                     if is_caps_lock(key) {
-                        if state == 1 {
-                            key_event(
-                                self.event_source.clone(),
-                                code,
-                                1,
-                                self.modifier_state.get(),
-                            );
-                            key_event(
-                                self.event_source.clone(),
-                                code,
-                                0,
-                                self.modifier_state.get(),
-                            );
-                            toggle_caps_lock(&self.modifier_state);
-                        }
+                        self.handle_caps_lock(state).await;
                         return Ok(());
                     }
 
@@ -1041,8 +1364,9 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::{
-        PhysicalModifiers, XMods, button_event_spec, commit_button_state, is_caps_lock,
-        set_modifiers, toggle_caps_lock, union_to_global, update_modifiers,
+        InputSourceDescriptor, InputSourceHistoryKey, PhysicalModifiers, XMods, button_event_spec,
+        caps_lock_press_completed, choose_non_ascii_input_source, commit_button_state,
+        is_caps_lock, set_modifiers, union_to_global, update_modifiers,
     };
     use input_event::{
         BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
@@ -1053,6 +1377,86 @@ mod tests {
     };
     use std::cell::Cell;
     use std::collections::HashSet;
+
+    #[test]
+    fn caps_switch_prefers_the_last_non_ascii_source() {
+        let sources = [
+            InputSourceDescriptor {
+                id: "com.apple.keylayout.ABC".into(),
+                ascii_capable: true,
+            },
+            InputSourceDescriptor {
+                id: "com.apple.inputmethod.TCIM.Zhuyin".into(),
+                ascii_capable: false,
+            },
+            InputSourceDescriptor {
+                id: "com.apple.inputmethod.Korean.2SetKorean".into(),
+                ascii_capable: false,
+            },
+        ];
+        assert_eq!(
+            choose_non_ascii_input_source(
+                &sources,
+                Some("com.apple.inputmethod.Korean.2SetKorean"),
+                &[],
+            )
+            .as_deref(),
+            Some("com.apple.inputmethod.Korean.2SetKorean")
+        );
+        assert_eq!(
+            choose_non_ascii_input_source(
+                &sources,
+                Some("missing.source"),
+                &[
+                    InputSourceHistoryKey::Id("disabled.source".into()),
+                    InputSourceHistoryKey::Id("com.apple.inputmethod.Korean.2SetKorean".into()),
+                ],
+            )
+            .as_deref(),
+            Some("com.apple.inputmethod.Korean.2SetKorean")
+        );
+        assert_eq!(choose_non_ascii_input_source(&sources, None, &[]), None);
+    }
+
+    #[test]
+    fn caps_switches_once_after_a_complete_press() {
+        let mut pressed = false;
+        assert!(!caps_lock_press_completed(&mut pressed, 0));
+        assert!(!caps_lock_press_completed(&mut pressed, 1));
+        assert!(!caps_lock_press_completed(&mut pressed, 2));
+        assert!(caps_lock_press_completed(&mut pressed, 0));
+        assert!(!caps_lock_press_completed(&mut pressed, 0));
+    }
+
+    #[test]
+    #[ignore = "temporarily changes the active macOS input source"]
+    fn caps_switch_round_trips_the_active_input_source() {
+        use super::{
+            current_non_ascii_input_source_id, input_source_descriptor,
+            switch_caps_lock_input_source, with_current_input_source,
+        };
+
+        let before = with_current_input_source(input_source_descriptor)
+            .flatten()
+            .expect("current input source");
+        let mut last_non_ascii = current_non_ascii_input_source_id();
+        let (_, first_target) =
+            switch_caps_lock_input_source(&mut last_non_ascii).expect("first input-source switch");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after_first = with_current_input_source(input_source_descriptor)
+            .flatten()
+            .expect("input source after first switch");
+        assert_eq!(after_first.id, first_target);
+
+        let (_, second_target) =
+            switch_caps_lock_input_source(&mut last_non_ascii).expect("second input-source switch");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after_second = with_current_input_source(input_source_descriptor)
+            .flatten()
+            .expect("input source after second switch");
+        assert_eq!(after_second.id, second_target);
+        assert_eq!(after_second.id, before.id);
+    }
 
     #[test]
     fn union_to_global_is_identity_when_the_primary_is_top_left() {
@@ -1074,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_lock_is_a_tap_not_a_repeatable_modifier() {
+    fn caps_lock_is_not_an_aggregate_modifier() {
         let physical = Cell::new(PhysicalModifiers::empty());
         let modifiers = Cell::new(XMods::empty());
 
@@ -1088,9 +1492,6 @@ mod tests {
         assert!(physical.get().is_empty());
         assert!(modifiers.get().is_empty());
 
-        toggle_caps_lock(&modifiers);
-        assert_eq!(modifiers.get(), XMods::LockMask);
-        toggle_caps_lock(&modifiers);
         assert!(modifiers.get().is_empty());
     }
 
