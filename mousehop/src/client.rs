@@ -317,6 +317,20 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_peer_capabilities(&self, handle: ClientHandle, capabilities: u32) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.peer_capabilities = capabilities;
+        }
+    }
+
+    pub(crate) fn peer_capabilities(&self, handle: ClientHandle) -> u32 {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(_, state)| state.peer_capabilities)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()

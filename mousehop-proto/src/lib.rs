@@ -10,6 +10,9 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod clipboard_transfer;
+use clipboard_transfer::{ClipboardStreamOffer, ClipboardTransferError};
+
 /// Defines the maximum size a fixed-buffer encoded event can take up.
 /// Clipboard and display-topology events use their dedicated variable-length
 /// codecs; every other event fits in this size. Transactional input adds a
@@ -21,6 +24,10 @@ pub const MAX_EVENT_SIZE: usize =
 /// fingerprint + content + length prefixes). 4 KiB is conservative
 /// against typical UDP MTU.
 pub const MAX_CLIPBOARD_SIZE: usize = 4 * 1024;
+
+/// Control offers stay small enough for one DTLS datagram. Bulk bytes never
+/// use this buffer.
+pub const MAX_CLIPBOARD_OFFER_SIZE: usize = 1024;
 
 /// Version of the variable-length [`ProtoEvent::DisplayLayout`] wire payload.
 pub const DISPLAY_LAYOUT_VERSION: u8 = 1;
@@ -72,8 +79,23 @@ pub const CAP_ATOMIC_HANDOVER: u32 = 1 << 0;
 /// was actually applied.
 pub const CAP_TRANSACTIONAL_HANDOVER: u32 = 1 << 1;
 
-/// Capabilities implemented completely by this protocol build.
-pub const PROTOCOL_CAPABILITIES: u32 = CAP_ATOMIC_HANDOVER | CAP_TRANSACTIONAL_HANDOVER;
+/// Peer supports clipboard-v2 offers and a separate reliable bulk stream.
+pub const CAP_CLIPBOARD_V2: u32 = 1 << 2;
+
+/// Peer can publish lossless PNG clipboard images.
+pub const CAP_CLIPBOARD_IMAGE: u32 = 1 << 3;
+
+/// Peer can materialize file-tree clipboard transfers.
+pub const CAP_CLIPBOARD_FILES: u32 = 1 << 4;
+
+/// Capabilities implemented completely by this protocol build. Clipboard-v2
+/// bits are enabled individually only after the bulk transport and the
+/// corresponding platform backend are wired end to end.
+pub const PROTOCOL_CAPABILITIES: u32 = CAP_ATOMIC_HANDOVER
+    | CAP_TRANSACTIONAL_HANDOVER
+    | CAP_CLIPBOARD_V2
+    | CAP_CLIPBOARD_IMAGE
+    | CAP_CLIPBOARD_FILES;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -93,6 +115,9 @@ pub enum ProtocolError {
     /// clipboard payload exceeds [`MAX_CLIPBOARD_SIZE`]
     #[error("clipboard payload too large: {0} bytes")]
     ClipboardTooLarge(usize),
+    /// malformed clipboard-v2 control metadata
+    #[error(transparent)]
+    ClipboardTransfer(#[from] ClipboardTransferError),
     /// clipboard text is not valid UTF-8
     #[error("invalid UTF-8 in clipboard payload")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
@@ -260,6 +285,8 @@ pub enum ProtoEvent {
         from_fingerprint: String,
         content: String,
     },
+    /// Announces a separately encrypted reliable clipboard stream.
+    ClipboardStreamOffer(ClipboardStreamOffer),
     /// Confirmed lock/unlock state of the capturing host. A locked sender has
     /// already released capture; an unlocked event is informational and does
     /// not resume forwarding without a fresh edge crossing.
@@ -360,19 +387,18 @@ impl Display for ProtoEvent {
                 from_fingerprint,
                 content,
             } => {
-                let head: String = content.chars().take(40).collect();
-                let preview = if head.len() < content.len() {
-                    format!("{head}…")
-                } else {
-                    head
-                };
                 write!(
                     f,
-                    "Clipboard(from={}…, {}b: {preview})",
+                    "Clipboard(from={}…, {}b)",
                     &from_fingerprint[..from_fingerprint.len().min(8)],
                     content.len(),
                 )
             }
+            ProtoEvent::ClipboardStreamOffer(stream) => write!(
+                f,
+                "ClipboardStreamOffer({}, {:?}, {}b, port={})",
+                stream.offer.transfer_id, stream.offer.kind, stream.offer.total_bytes, stream.port
+            ),
             ProtoEvent::HostInputState { state, generation } => {
                 write!(f, "HostInputState({state:?}, generation={generation})")
             }
@@ -462,6 +488,8 @@ pub enum EventType {
     HandoverLeaveAck,
     /// Receiver reports that a handover serial no longer owns input.
     OwnershipLost,
+    /// Small clipboard-v2 control offer. Appended for wire stability.
+    ClipboardStreamOffer,
 }
 
 fn input_event_wire_len(event_type: EventType) -> Option<usize> {
@@ -557,6 +585,8 @@ impl ProtoEvent {
                 },
                 InputEvent::Clipboard(c) => match c {
                     ClipboardEvent::Text(_) => EventType::Clipboard,
+                    ClipboardEvent::ImageRgba { .. } => EventType::Clipboard,
+                    ClipboardEvent::Files { .. } => EventType::Clipboard,
                 },
             },
             ProtoEvent::Ping => EventType::Ping,
@@ -570,6 +600,7 @@ impl ProtoEvent {
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::ReceiverSensitivity { .. } => EventType::ReceiverSensitivity,
             ProtoEvent::Clipboard { .. } => EventType::Clipboard,
+            ProtoEvent::ClipboardStreamOffer(_) => EventType::ClipboardStreamOffer,
             ProtoEvent::HostInputState { .. } => EventType::HostInputState,
             ProtoEvent::HostInputStateAck { .. } => EventType::HostInputStateAck,
             ProtoEvent::DisplayLayout { .. } => EventType::DisplayLayout,
@@ -637,7 +668,9 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             // Clipboard frames are variable-length and never arrive
             // through the fixed-size buffer path; the connect/listen
             // layer routes them through `decode_clipboard_event`.
-            EventType::Clipboard => Err(ProtocolError::BufferTooSmall),
+            EventType::Clipboard | EventType::ClipboardStreamOffer => {
+                Err(ProtocolError::BufferTooSmall)
+            }
             EventType::HostInputState => Ok(Self::HostInputState {
                 state: decode_u8(&mut buf)?.try_into()?,
                 generation: decode_u32(&mut buf)?,
@@ -738,7 +771,7 @@ pub fn decode_fixed_event(bytes: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         EventType::HandoverAck => (bytes.len() == 6, "6 bytes"),
         EventType::HandoverLeave => (bytes.len() == 9, "9 bytes"),
         EventType::HandoverLeaveAck | EventType::OwnershipLost => (bytes.len() == 5, "5 bytes"),
-        EventType::Clipboard | EventType::DisplayLayout => {
+        EventType::Clipboard | EventType::DisplayLayout | EventType::ClipboardStreamOffer => {
             (false, "a dedicated variable-length frame")
         }
     };
@@ -860,6 +893,12 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     panic!(
                         "ProtoEvent::Clipboard cannot use the fixed-buffer encoder; \
                          route via encode_clipboard_event"
+                    );
+                }
+                ProtoEvent::ClipboardStreamOffer(_) => {
+                    panic!(
+                        "ProtoEvent::ClipboardStreamOffer cannot use the fixed-buffer encoder; \
+                         route via encode_clipboard_stream_offer"
                     );
                 }
                 ProtoEvent::HostInputState { state, generation }
@@ -1150,6 +1189,51 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     })
 }
 
+/// Wire format for a clipboard-v2 control offer:
+/// `[tag: u8][port: u16 BE][key: 32][offer_len: u16 BE][offer]`.
+pub fn encode_clipboard_stream_offer(event: &ProtoEvent) -> Result<Vec<u8>, ProtocolError> {
+    let ProtoEvent::ClipboardStreamOffer(stream) = event else {
+        panic!("encode_clipboard_stream_offer called on another event")
+    };
+    let offer = stream.offer.encode()?;
+    let total = 1 + 2 + 32 + 2 + offer.len();
+    if total > MAX_CLIPBOARD_OFFER_SIZE {
+        return Err(ProtocolError::ClipboardTooLarge(total));
+    }
+    let mut out = Vec::with_capacity(total);
+    out.push(EventType::ClipboardStreamOffer as u8);
+    out.extend_from_slice(&stream.port.to_be_bytes());
+    out.extend_from_slice(&stream.key.into_bytes());
+    out.extend_from_slice(&(offer.len() as u16).to_be_bytes());
+    out.extend_from_slice(&offer);
+    Ok(out)
+}
+
+pub fn decode_clipboard_stream_offer(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
+    if buf.len() > MAX_CLIPBOARD_OFFER_SIZE {
+        return Err(ProtocolError::ClipboardTooLarge(buf.len()));
+    }
+    if buf.len() < 37 || buf[0] != EventType::ClipboardStreamOffer as u8 {
+        return Err(ProtocolError::BufferTooSmall);
+    }
+    let port = u16::from_be_bytes([buf[1], buf[2]]);
+    let key = clipboard_transfer::TransferKey::from_bytes(
+        buf[3..35]
+            .try_into()
+            .map_err(|_| ProtocolError::BufferTooSmall)?,
+    );
+    let offer_len = u16::from_be_bytes([buf[35], buf[36]]) as usize;
+    if buf.len() != 37 + offer_len {
+        return Err(ProtocolError::BufferTooSmall);
+    }
+    let offer = clipboard_transfer::ClipboardOffer::decode(&buf[37..])?;
+    Ok(ProtoEvent::ClipboardStreamOffer(ClipboardStreamOffer {
+        offer,
+        port,
+        key,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,6 +1285,34 @@ mod tests {
             decode_clipboard_event(truncated),
             Err(ProtocolError::BufferTooSmall)
         ));
+    }
+
+    #[test]
+    fn clipboard_stream_offer_round_trip_redacts_key() {
+        use clipboard_transfer::{ClipboardItemKind, ClipboardOffer, TransferId, TransferKey};
+        let event = ProtoEvent::ClipboardStreamOffer(ClipboardStreamOffer {
+            offer: ClipboardOffer {
+                transfer_id: TransferId([1; 16]),
+                origin_fingerprint: "aa:bb".into(),
+                kind: ClipboardItemKind::TextUtf8,
+                total_bytes: 1_000_000,
+                item_count: 1,
+                image_width: 0,
+                image_height: 0,
+            },
+            port: 4242,
+            key: TransferKey::from_bytes([0xab; 32]),
+        });
+        let encoded = encode_clipboard_stream_offer(&event).unwrap();
+        let decoded = decode_clipboard_stream_offer(&encoded).unwrap();
+        let (ProtoEvent::ClipboardStreamOffer(decoded), ProtoEvent::ClipboardStreamOffer(expected)) =
+            (decoded, event.clone())
+        else {
+            panic!("wrong event type")
+        };
+        assert_eq!(decoded, expected);
+        assert!(!format!("{event:?}").contains("171"));
+        assert!(!format!("{event}").contains("ab"));
     }
 
     #[test]

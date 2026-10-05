@@ -2,6 +2,7 @@ use arboard::Clipboard;
 use input_event::{ClipboardEvent, Event};
 use mousehop_ipc::AppIdent;
 use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -22,7 +23,7 @@ pub type SuppressionList = Arc<Mutex<HashSet<AppIdent>>>;
 pub struct ClipboardMonitor {
     event_rx: Receiver<CaptureEvent>,
     _event_tx: Sender<CaptureEvent>,
-    last_content: Arc<Mutex<Option<String>>>,
+    last_content: Arc<Mutex<Option<u64>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
 }
@@ -37,15 +38,13 @@ impl ClipboardMonitor {
     }
 
     /// Construct a monitor that consults `suppression` on every
-    /// detected clipboard change and skips both the emit AND the
-    /// `last_content` update when [`frontmost_app::frontmost_app()`]
-    /// reports an app whose [`AppIdent`] is in the list. Skipping
-    /// the `last_content` update is intentional: it keeps the
-    /// monitor "blind" to the suppressed content so a later non-
-    /// suppressed copy of the same string still emits normally.
+    /// detected clipboard change and skips the emit when
+    /// [`frontmost_app::frontmost_app()`] reports an app whose [`AppIdent`]
+    /// is in the list. The content signature still advances, preventing the
+    /// same sensitive value from being reconsidered after a focus change.
     pub fn with_suppression(suppression: SuppressionList) -> Result<Self, CaptureError> {
         let (event_tx, event_rx) = mpsc::channel(16);
-        let last_content: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_content: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
@@ -110,18 +109,11 @@ impl ClipboardMonitor {
                         }
                     };
 
-                    // Get current clipboard text
-                    let current_text = match clipboard.get_text() {
-                        Ok(text) => {
-                            log::trace!("Clipboard text read: {} bytes", text.len());
-                            text
-                        }
-                        Err(e) => {
-                            // Clipboard might be empty or contain non-text data
-                            log::trace!("Failed to get clipboard text: {e}");
-                            return;
-                        }
+                    let current = match read_clipboard_event(&mut clipboard) {
+                        Some(event) => event,
+                        None => return,
                     };
+                    let signature = clipboard_signature(&current);
 
                     // Check if content changed
                     let mut last_content = last_content_clone2.lock().unwrap();
@@ -134,11 +126,9 @@ impl ClipboardMonitor {
                     // actually changed (see PollDecision::classify).
                     // Pre-compute the inputs here so the classifier
                     // stays a pure function.
-                    let needs_decision = PollDecision::content_might_emit(
-                        &current_text,
-                        last_content.as_deref(),
-                        last_change_elapsed,
-                    );
+                    let changed = last_content.as_ref() != Some(&signature);
+                    let needs_decision =
+                        PollDecision::content_might_emit(changed, last_change_elapsed);
                     let (concealed, suppressed) = if needs_decision {
                         let concealed = is_concealed_clipboard();
                         let suppressed = if concealed {
@@ -151,8 +141,7 @@ impl ClipboardMonitor {
                         (false, None)
                     };
                     let decision = PollDecision::classify(
-                        &current_text,
-                        last_content.as_deref(),
+                        changed,
                         last_change_elapsed,
                         concealed,
                         suppressed.is_some(),
@@ -173,7 +162,7 @@ impl ClipboardMonitor {
                     // contract — see the unit tests at the
                     // bottom of this file.
                     if decision.advances_state() {
-                        *last_content = Some(current_text.clone());
+                        *last_content = Some(signature);
                         *last_change = Some(Instant::now());
                     }
                     match decision {
@@ -193,10 +182,24 @@ impl ClipboardMonitor {
                             }
                         }
                         PollDecision::Emit => {
-                            log::info!("Clipboard changed, length: {} bytes", current_text.len());
-                            let event = CaptureEvent::Input(Event::Clipboard(
-                                ClipboardEvent::Text(current_text),
-                            ));
+                            match &current {
+                                ClipboardEvent::Text(text) => {
+                                    log::info!("Clipboard text changed: {} bytes", text.len())
+                                }
+                                ClipboardEvent::ImageRgba {
+                                    width,
+                                    height,
+                                    bytes,
+                                } => log::info!(
+                                    "Clipboard image changed: {width}x{height}, {} bytes RGBA",
+                                    bytes.len()
+                                ),
+                                ClipboardEvent::Files { paths, .. } => log::info!(
+                                    "Clipboard file list changed: {} item(s)",
+                                    paths.len()
+                                ),
+                            }
+                            let event = CaptureEvent::Input(Event::Clipboard(current));
                             let _ = event_tx_clone2.blocking_send(event);
                         }
                     }
@@ -233,14 +236,78 @@ impl ClipboardMonitor {
         log::info!("Clipboard monitoring disabled");
     }
 
-    /// Update the last known clipboard content (called when we set the clipboard)
-    /// This prevents detecting our own clipboard changes as external changes
-    pub fn update_last_content(&self, content: String) {
+    /// Update the last known clipboard signature after applying a remote event.
+    /// This prevents detecting our own clipboard change as an external change.
+    pub fn update_last_event(&self, event: &ClipboardEvent) {
         let mut last_content = self.last_content.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
-        *last_content = Some(content);
+        *last_content = Some(clipboard_signature(event));
         *last_change = Some(Instant::now());
     }
+
+    pub fn update_last_content(&self, content: String) {
+        self.update_last_event(&ClipboardEvent::Text(content));
+    }
+}
+
+/// Read the richest available clipboard representation. File lists must be
+/// checked before text because desktop clipboards commonly expose copied files
+/// as both a native file list and `text/uri-list`.
+fn read_clipboard_event(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
+    if let Ok(paths) = clipboard.get().file_list() {
+        if !paths.is_empty() {
+            return Some(ClipboardEvent::Files {
+                paths,
+                owned_root: None,
+            });
+        }
+    }
+    if let Ok(image) = clipboard.get_image() {
+        let width = u32::try_from(image.width).ok()?;
+        let height = u32::try_from(image.height).ok()?;
+        let pixels = u64::from(width).checked_mul(u64::from(height))?;
+        if pixels <= 100_000_000 && image.bytes.len() <= 128 * 1024 * 1024 {
+            return Some(ClipboardEvent::ImageRgba {
+                width,
+                height,
+                bytes: image.bytes.into_owned(),
+            });
+        }
+        log::warn!("clipboard image exceeds transfer limits: {width}x{height}");
+        return None;
+    }
+    clipboard.get_text().ok().map(ClipboardEvent::Text)
+}
+
+pub fn clipboard_signature(event: &ClipboardEvent) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match event {
+        ClipboardEvent::Text(text) => {
+            0_u8.hash(&mut hasher);
+            text.hash(&mut hasher);
+        }
+        ClipboardEvent::ImageRgba {
+            width,
+            height,
+            bytes,
+        } => {
+            1_u8.hash(&mut hasher);
+            width.hash(&mut hasher);
+            height.hash(&mut hasher);
+            bytes.hash(&mut hasher);
+        }
+        ClipboardEvent::Files { paths, .. } => {
+            2_u8.hash(&mut hasher);
+            for path in paths {
+                path.hash(&mut hasher);
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    metadata.len().hash(&mut hasher);
+                    metadata.modified().ok().hash(&mut hasher);
+                }
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// macOS password managers stamp `org.nspasteboard.ConcealedType`
@@ -347,12 +414,8 @@ impl PollDecision {
     /// expensive `is_concealed_clipboard()` / `frontmost_app()` /
     /// `is_suppressed()` calls when the content hasn't changed
     /// or the debounce window blocks emission anyway.
-    fn content_might_emit(
-        current_text: &str,
-        last_content: Option<&str>,
-        last_change_elapsed: Option<Duration>,
-    ) -> bool {
-        if last_content == Some(current_text) {
+    fn content_might_emit(changed: bool, last_change_elapsed: Option<Duration>) -> bool {
+        if !changed {
             return false;
         }
         last_change_elapsed.is_none_or(|d| d > Duration::from_millis(200))
@@ -362,13 +425,12 @@ impl PollDecision {
     /// I/O, no global state — so the focus-race invariant is
     /// expressible as a series of `assert_eq!` calls.
     fn classify(
-        current_text: &str,
-        last_content: Option<&str>,
+        changed: bool,
         last_change_elapsed: Option<Duration>,
         concealed: bool,
         suppressed_match: bool,
     ) -> Self {
-        if last_content == Some(current_text) {
+        if !changed {
             return Self::Unchanged;
         }
         let debounce_passed = last_change_elapsed.is_none_or(|d| d > Duration::from_millis(200));
@@ -396,13 +458,7 @@ mod tests {
 
     #[test]
     fn classify_unchanged_when_text_matches_last_content() {
-        let d = PollDecision::classify(
-            "secret",
-            Some("secret"),
-            Some(Duration::from_secs(60)),
-            false,
-            false,
-        );
+        let d = PollDecision::classify(false, Some(Duration::from_secs(60)), false, false);
         assert_eq!(d, PollDecision::Unchanged);
         assert!(!d.advances_state());
     }
@@ -412,26 +468,14 @@ mod tests {
         // Content differs but only 100ms since last advance —
         // hold off so a peer's set_clipboard echo doesn't bounce
         // back as a fresh local emit.
-        let d = PollDecision::classify(
-            "new",
-            Some("old"),
-            Some(Duration::from_millis(100)),
-            false,
-            false,
-        );
+        let d = PollDecision::classify(true, Some(Duration::from_millis(100)), false, false);
         assert_eq!(d, PollDecision::Debounced);
         assert!(!d.advances_state());
     }
 
     #[test]
     fn classify_emit_when_changed_unsuppressed() {
-        let d = PollDecision::classify(
-            "new",
-            Some("old"),
-            Some(Duration::from_secs(1)),
-            false,
-            false,
-        );
+        let d = PollDecision::classify(true, Some(Duration::from_secs(1)), false, false);
         assert_eq!(d, PollDecision::Emit);
         assert!(d.advances_state());
     }
@@ -441,31 +485,19 @@ mod tests {
         // No prior advance: the first poll always falls through
         // to Emit (assuming nothing's suppressed) so the very
         // first clipboard read after startup is broadcast.
-        let d = PollDecision::classify("first", None, None, false, false);
+        let d = PollDecision::classify(true, None, false, false);
         assert_eq!(d, PollDecision::Emit);
     }
 
     #[test]
     fn classify_suppressed_when_concealed() {
-        let d = PollDecision::classify(
-            "password",
-            Some("plain"),
-            Some(Duration::from_secs(1)),
-            true,
-            false,
-        );
+        let d = PollDecision::classify(true, Some(Duration::from_secs(1)), true, false);
         assert_eq!(d, PollDecision::Suppressed);
     }
 
     #[test]
     fn classify_suppressed_when_app_list_matches() {
-        let d = PollDecision::classify(
-            "password",
-            Some("plain"),
-            Some(Duration::from_secs(1)),
-            false,
-            true,
-        );
+        let d = PollDecision::classify(true, Some(Duration::from_secs(1)), false, true);
         assert_eq!(d, PollDecision::Suppressed);
     }
 
@@ -475,13 +507,7 @@ mod tests {
     /// leaks on Ghostty alt-tab after copy) is back.
     #[test]
     fn suppressed_decision_advances_state() {
-        let d = PollDecision::classify(
-            "password",
-            Some("plain"),
-            Some(Duration::from_secs(1)),
-            false,
-            true,
-        );
+        let d = PollDecision::classify(true, Some(Duration::from_secs(1)), false, true);
         assert!(
             d.advances_state(),
             "Suppressed must advance last_content; otherwise the \
@@ -496,14 +522,14 @@ mod tests {
     /// emit (echo loop).
     #[test]
     fn non_state_changing_decisions_do_not_advance() {
-        for (current, last, elapsed) in [
-            ("same", Some("same"), Some(Duration::from_secs(1))),
-            ("new", Some("old"), Some(Duration::from_millis(50))),
+        for (changed, elapsed) in [
+            (false, Some(Duration::from_secs(1))),
+            (true, Some(Duration::from_millis(50))),
         ] {
-            let d = PollDecision::classify(current, last, elapsed, false, false);
+            let d = PollDecision::classify(changed, elapsed, false, false);
             assert!(
                 !d.advances_state(),
-                "{d:?} should not advance state (current={current:?} last={last:?} elapsed={elapsed:?})"
+                "{d:?} should not advance state (changed={changed:?} elapsed={elapsed:?})"
             );
         }
     }
@@ -513,21 +539,38 @@ mod tests {
         // Used by the poll loop to short-circuit the expensive
         // suppression probes. Same matrix as `classify`'s "no
         // emission possible" cases.
+        assert!(!PollDecision::content_might_emit(false, None));
         assert!(!PollDecision::content_might_emit(
-            "same",
-            Some("same"),
-            None
-        ));
-        assert!(!PollDecision::content_might_emit(
-            "new",
-            Some("old"),
+            true,
             Some(Duration::from_millis(50))
         ));
         assert!(PollDecision::content_might_emit(
-            "new",
-            Some("old"),
+            true,
             Some(Duration::from_secs(1))
         ));
-        assert!(PollDecision::content_might_emit("new", None, None));
+        assert!(PollDecision::content_might_emit(true, None));
+    }
+
+    #[test]
+    fn signatures_distinguish_clipboard_kinds_and_ignore_staging_owner() {
+        let staging = tempfile::tempdir().unwrap();
+        let files = ClipboardEvent::Files {
+            paths: vec!["/tmp/a".into()],
+            owned_root: Some(input_event::ClipboardFileLease::new(
+                staging.path().to_path_buf(),
+            )),
+        };
+        let same_files = ClipboardEvent::Files {
+            paths: vec!["/tmp/a".into()],
+            owned_root: None,
+        };
+        assert_eq!(
+            clipboard_signature(&files),
+            clipboard_signature(&same_files)
+        );
+        assert_ne!(
+            clipboard_signature(&files),
+            clipboard_signature(&ClipboardEvent::Text("/tmp/a".into()))
+        );
     }
 }

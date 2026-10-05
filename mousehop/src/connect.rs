@@ -6,8 +6,8 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::{ClientHandle, ConnectionMode, DEFAULT_PORT};
 use mousehop_proto::{
     MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
-    decode_display_layout_event, decode_fixed_event, encode_clipboard_event,
-    encode_display_layout_event,
+    decode_clipboard_stream_offer, decode_display_layout_event, decode_fixed_event,
+    encode_clipboard_event, encode_clipboard_stream_offer, encode_display_layout_event,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -430,6 +430,13 @@ impl MousehopConnection {
                     return Ok(());
                 }
             },
+            ProtoEvent::ClipboardStreamOffer(_) => match encode_clipboard_stream_offer(&event) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!("dropping invalid clipboard stream offer for client {handle}: {e}");
+                    return Ok(());
+                }
+            },
             ProtoEvent::DisplayLayout { .. } => match encode_display_layout_event(&event) {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -541,6 +548,13 @@ impl MousehopConnection {
                 Ok(v) => Some(v),
                 Err(e) => {
                     log::warn!("dropping oversize clipboard event for client {handle}: {e}");
+                    return Ok(());
+                }
+            },
+            ProtoEvent::ClipboardStreamOffer(_) => match encode_clipboard_stream_offer(&event) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!("dropping invalid clipboard stream offer for client {handle}: {e}");
                     return Ok(());
                 }
             },
@@ -794,6 +808,7 @@ async fn connect_to_handle(
         // the previous connection and send input before the new peer has
         // completed Hello/Pong validation.
         client_manager.set_alive(handle, false);
+        client_manager.set_peer_capabilities(handle, 0);
         client_manager.set_active_addr(handle, Some(addr));
         let replaced = conns_guard.insert(
             addr,
@@ -819,6 +834,7 @@ async fn connect_to_handle(
                 client_manager.set_alive(replaced.handle, false);
                 client_manager.set_active_addr(replaced.handle, None);
                 client_manager.set_peer_commit(replaced.handle, None);
+                client_manager.set_peer_capabilities(replaced.handle, 0);
                 sessions.remove_if_current(replaced.handle, replaced.session);
                 let _ = tx.send(MousehopConnectionEvent::Disconnected {
                     handle: replaced.handle,
@@ -1089,6 +1105,7 @@ async fn receive_loop(
                 }
                 hello_ok.set(true);
                 client_manager.set_peer_commit(handle, Some(commit));
+                client_manager.set_peer_capabilities(handle, capabilities);
                 // Forward to capture.rs so Service can
                 // broadcast — without this the GUI's
                 // version-status indicator only updates when
@@ -1141,6 +1158,9 @@ fn decode_proto_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
     let tag = *bytes.first()?;
     if tag == EventType::Clipboard as u8 {
         return decode_clipboard_event(bytes).ok();
+    }
+    if tag == EventType::ClipboardStreamOffer as u8 {
+        return decode_clipboard_stream_offer(bytes).ok();
     }
     if tag == EventType::DisplayLayout as u8 {
         return decode_display_layout_event(bytes).ok();
@@ -1204,6 +1224,7 @@ async fn disconnect(
             client_manager.set_alive(handle, false);
             client_manager.set_active_addr(handle, None);
             client_manager.set_peer_commit(handle, None);
+            client_manager.set_peer_capabilities(handle, 0);
         }
         sessions.remove_if_current(handle, session);
         let _ = tx.send(MousehopConnectionEvent::Disconnected { handle, session });

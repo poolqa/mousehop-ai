@@ -1,4 +1,8 @@
-use std::fmt::{self, Display};
+use std::{
+    fmt::{self, Display},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +79,53 @@ pub enum KeyboardEvent {
 pub enum ClipboardEvent {
     /// text content from clipboard
     Text(String),
+    /// Clipboard bitmap in row-major, un-premultiplied RGBA8 form. The bulk
+    /// protocol uses PNG on the wire and decodes into this platform-neutral
+    /// representation only after validating its dimensions.
+    ImageRgba {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+    /// Platform clipboard file list. Local capture uses `owned_root = None`;
+    /// received file trees set it to the private staging directory so the
+    /// clipboard sink can retain and later reclaim the downloaded files.
+    Files {
+        paths: Vec<PathBuf>,
+        owned_root: Option<ClipboardFileLease>,
+    },
+}
+
+/// Shared lifetime token for a received clipboard file tree. The staging
+/// directory is reclaimed only after the clipboard sink, forwarding tasks,
+/// and all event clones have released it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardFileLease(Arc<ClipboardFileLeaseInner>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClipboardFileLeaseInner(PathBuf);
+
+impl ClipboardFileLease {
+    pub fn new(path: PathBuf) -> Self {
+        Self(Arc::new(ClipboardFileLeaseInner(path)))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0.0
+    }
+}
+
+impl Drop for ClipboardFileLeaseInner {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::debug!(
+                    "failed to remove clipboard staging directory {:?}: {error}",
+                    self.0
+                );
+            }
+        }
+    }
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -159,12 +210,15 @@ impl Display for ClipboardEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClipboardEvent::Text(text) => {
-                let preview = if text.len() > 50 {
-                    format!("{}...", &text[..50])
-                } else {
-                    text.clone()
-                };
-                write!(f, "clipboard(text: {preview})")
+                write!(f, "clipboard(text: {}b)", text.len())
+            }
+            ClipboardEvent::ImageRgba {
+                width,
+                height,
+                bytes,
+            } => write!(f, "clipboard(image: {width}x{height}, {}b)", bytes.len()),
+            ClipboardEvent::Files { paths, .. } => {
+                write!(f, "clipboard(files: {} item(s))", paths.len())
             }
         }
     }

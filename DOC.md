@@ -1,5 +1,50 @@
 # General Software Architecture
 
+## Clipboard transfer architecture
+
+Clipboard v1 remains the active compatibility path: UTF-8 text up to 4 KiB is
+carried in one DTLS datagram. Large application data must not use that path,
+because the DTLS implementation does not fragment or retransmit application
+records.
+
+The clipboard-v2 protocol lives in
+`mousehop-proto::clipboard_transfer`. It defines bounded offers and reliable
+stream frames for UTF-8 text, PNG images, and file trees. Mouse/keyboard and
+small control messages stay on DTLS; bulk payloads use a separate,
+authenticated reliable stream. `CAP_CLIPBOARD_V2`, `CAP_CLIPBOARD_IMAGE`, and
+`CAP_CLIPBOARD_FILES` are advertised independently so mixed-version peers skip
+formats they cannot publish.
+
+Bulk receivers must validate `TransferLimits` before accepting an offer, write
+file chunks into a transfer-specific staging directory, verify item digests,
+and only publish the resulting local paths to the OS clipboard after the whole
+transfer completes. Manifest paths are normalized relative `/` paths; absolute
+paths, traversal components, Windows drive roots, and backslashes are rejected
+by the protocol codec. Symbolic links and special filesystem entries are not
+sent. Received file trees carry a shared lifetime lease: replacing the local
+clipboard releases its lease, while in-flight fan-out tasks retain theirs, and
+the staging directory is removed only after the last lease is dropped.
+
+The transport implementation is split between
+`mousehop::clipboard_bulk` and `mousehop::clipboard_receive`. Bulk frames use
+u32 length prefixes over a reliable byte stream and AES-256-GCM with a
+one-transfer key delivered by the authenticated control channel. Nonces are
+domain-separated by stream direction and monotonically sequenced; the transfer
+ID and sequence are authenticated as associated data. The transfer key and
+ephemeral TCP port are carried only in the authenticated DTLS offer. The
+receiver bounds the
+encrypted length before allocation, streams chunks to a fresh temporary
+directory, requires contiguous offsets, and verifies SHA-256 before making an
+item complete. The source waits for a completion acknowledgement before
+considering the copy delivered.
+
+`input-capture::clipboard` queries the OS clipboard in file-list, bitmap, then
+text order. This preserves native file copies that also expose a URI-list text
+fallback. `arboard` maps the file list to CF_HDROP on Windows, file URLs on
+macOS, and `text/uri-list` on Linux. Bitmaps are normalized to RGBA8 in memory,
+encoded losslessly as PNG for transfer, and decoded only after the offer,
+payload size, dimensions, and digest have passed validation.
+
 ## Events
 
 Each instance of mousehop can emit and receive events, where

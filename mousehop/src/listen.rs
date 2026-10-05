@@ -3,8 +3,8 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::IncomingPeerConfig;
 use mousehop_proto::{
     MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
-    decode_display_layout_event, decode_fixed_event, encode_clipboard_event,
-    encode_display_layout_event,
+    decode_clipboard_stream_offer, decode_display_layout_event, decode_fixed_event,
+    encode_clipboard_event, encode_clipboard_stream_offer, encode_display_layout_event,
 };
 use rustls::pki_types::CertificateDer;
 use std::{
@@ -317,6 +317,7 @@ impl MousehopListener {
         log::trace!("reply {event} >=>=>=>=>=> {addr} session {session}");
         let bytes_owned = match &event {
             ProtoEvent::Clipboard { .. } => encode_clipboard_event(&event),
+            ProtoEvent::ClipboardStreamOffer(_) => encode_clipboard_stream_offer(&event),
             ProtoEvent::DisplayLayout { .. } => encode_display_layout_event(&event),
             _ => Ok(Vec::new()),
         };
@@ -931,6 +932,9 @@ fn decode_listen_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
     let tag = *bytes.first()?;
     if tag == EventType::Clipboard as u8 {
         return decode_clipboard_event(bytes).ok();
+    }
+    if tag == EventType::ClipboardStreamOffer as u8 {
+        return decode_clipboard_stream_offer(bytes).ok();
     }
     if tag == EventType::DisplayLayout as u8 {
         return decode_display_layout_event(bytes).ok();

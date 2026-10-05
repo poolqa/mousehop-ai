@@ -1,3 +1,4 @@
+use crate::clipboard_receive::receive_stream;
 use crate::config::local_commit;
 use crate::listen::{ListenEvent, ListenerCreationError, ListenerSession, MousehopListener};
 use futures::StreamExt;
@@ -10,6 +11,7 @@ use input_event::{
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::IncomingPeerConfig;
+use mousehop_proto::clipboard_transfer::TransferLimits;
 use mousehop_proto::{
     CAP_TRANSACTIONAL_HANDOVER, HandoverWarpStatus, HostInputState, LEAVE_HANDOVER,
     LEAVE_RELEASE_ONLY, Position, ProtoEvent,
@@ -270,7 +272,7 @@ pub(crate) enum EmulationEvent {
     ClipboardReceived {
         addr: SocketAddr,
         from_fingerprint: String,
-        content: String,
+        event: ClipboardEvent,
     },
 }
 
@@ -882,8 +884,49 @@ impl ListenTask {
                                     self.event_tx.send(EmulationEvent::ClipboardReceived {
                                         addr,
                                         from_fingerprint,
-                                        content,
+                                        event: ClipboardEvent::Text(content),
                                     }).expect("channel closed");
+                                }
+                            }
+                            ProtoEvent::ClipboardStreamOffer(stream_offer) => {
+                                let receive_ok = self.addr_to_fingerprint
+                                    .get(&addr)
+                                    .and_then(|fp| self.incoming_peers.get(fp))
+                                    .map(|peer| peer.clipboard_receive)
+                                    .unwrap_or(false);
+                                if !receive_ok {
+                                    log::debug!(
+                                        "dropping clipboard-v2 offer from {addr}: clipboard_receive disabled or unauthorized peer"
+                                    );
+                                } else {
+                                    let proxy_tx = self.emulation_proxy.request_tx.clone();
+                                    let event_tx = self.event_tx.clone();
+                                    let origin = stream_offer.offer.origin_fingerprint.clone();
+                                    spawn_local(async move {
+                                        match receive_stream(addr, stream_offer, TransferLimits::default()).await {
+                                            Ok(staged) => match staged.into_event() {
+                                                Ok(event) => {
+                                                    if proxy_tx
+                                                        .send(ProxyRequest::Input(
+                                                            Event::Clipboard(event.clone()),
+                                                            addr,
+                                                        ))
+                                                        .is_err()
+                                                    {
+                                                        log::warn!("clipboard-v2 emulation task ended before publish");
+                                                        return;
+                                                    }
+                                                    let _ = event_tx.send(EmulationEvent::ClipboardReceived {
+                                                        addr,
+                                                        from_fingerprint: origin,
+                                                        event,
+                                                    });
+                                                }
+                                                Err(error) => log::warn!("clipboard-v2 publish decode failed: {error}"),
+                                            },
+                                            Err(error) => log::warn!("clipboard-v2 receive from {addr} failed: {error}"),
+                                        }
+                                    });
                                 }
                             }
                             ProtoEvent::HostInputState { state, generation } => {

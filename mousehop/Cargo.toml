@@ -43,6 +43,8 @@ tokio = { version = "1.32.0", features = [
     "rt",
     "sync",
     "signal",
+    "time",
+    "fs",
 ] }
 futures = "0.3.28"
 clap = { version = "4.4.11", features = ["derive"] }
@@ -58,6 +60,11 @@ rustls = { version = "0.23.12", default-features = false, features = [
 ] }
 rcgen = "0.13.1"
 sha2 = "0.10.8"
+aes-gcm = "0.10.3"
+rand = "0.8.5"
+tempfile = "3.25.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+walkdir = "2.5.0"
 notify = "8.2.0"
 if-addrs = "0.13"
 if-watch = { version = "3.2", features = ["tokio"] }

@@ -578,6 +578,10 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    /// Capability bitmap from the peer's current protocol Hello. Runtime-only;
+    /// zero means legacy or not yet negotiated.
+    #[serde(default)]
+    pub peer_capabilities: u32,
 }
 
 /// Receiver-side view of a remote host's input availability. `Locked` and

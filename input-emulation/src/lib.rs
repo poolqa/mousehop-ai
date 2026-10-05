@@ -5,7 +5,7 @@ use std::{
 };
 
 use input_event::{
-    ClipboardEvent, Event, KeyboardEvent, PointerEvent,
+    Event, KeyboardEvent, PointerEvent,
     display::{DisplayEdge, DisplayLayout},
 };
 
@@ -222,9 +222,9 @@ impl InputEmulation {
         // keyboard pipeline. Per-backend `consume` impls treat
         // `Event::Clipboard` as a no-op, so handling it here keeps
         // the dispatch in one place.
-        if let Event::Clipboard(ClipboardEvent::Text(text)) = &event {
+        if let Event::Clipboard(clipboard_event) = &event {
             if let Some(clipboard) = self.clipboard.as_ref() {
-                if let Err(e) = clipboard.set(ClipboardEvent::Text(text.clone())).await {
+                if let Err(e) = clipboard.set(clipboard_event.clone()).await {
                     log::warn!("failed to set clipboard: {e}");
                 }
             }

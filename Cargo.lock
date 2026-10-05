@@ -2240,8 +2240,9 @@ dependencies = [
 
 [[package]]
 name = "mousehop"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
+ "aes-gcm",
  "clap 4.6.0",
  "core-graphics",
  "env_logger",
@@ -2249,6 +2250,7 @@ dependencies = [
  "hostname",
  "if-addrs 0.13.4",
  "if-watch",
+ "image",
  "libc",
  "local-channel",
  "log",
@@ -2262,6 +2264,7 @@ dependencies = [
  "mousehop-proto",
  "netdev",
  "notify",
+ "rand",
  "rcgen",
  "rustls",
  "serde",
@@ -2269,11 +2272,13 @@ dependencies = [
  "sha2",
  "shadow-rs",
  "slab",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
  "toml_edit 0.22.27",
+ "walkdir",
  "webrtc-dtls",
  "webrtc-util",
  "windows 0.61.3",
@@ -2281,7 +2286,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-cli"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "clap 4.6.0",
  "futures",
@@ -2292,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-gtk"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "async-channel",
  "glib-build-tools",
@@ -2310,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-capture"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2347,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-emulation"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2374,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-event"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "futures-core",
  "log",
@@ -2386,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-ipc"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "futures",
  "log",
@@ -2400,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-proto"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "mousehop-input-event",
  "num_enum",

@@ -504,22 +504,31 @@ runtime state and are not persisted.
 
 ## Clipboard Sync
 
-Optional bi-directional clipboard text sync between paired peers. Disabled by default; enable per pair from the GUI or by editing `config.toml`.
+Optional bi-directional clipboard sync for text, images, and file lists between paired peers. Disabled by default; enable per pair from the GUI or by editing `config.toml`.
 
 ### Per-pair gates
 
-Each direction is independently gated. Both ends must opt in for clipboard text to flow that way:
+Each direction is independently gated. Both ends must opt in for clipboard data to flow that way:
 
 - **Outgoing**: `clipboard_send` on each `[[clients]]` entry — when true, copies on this device propagate to that peer.
-- **Incoming**: `clipboard_receive` on each `[authorized_fingerprints]` entry — when true, clipboard text from that peer is applied to this device's clipboard.
+- **Incoming**: `clipboard_receive` on each `[authorized_fingerprints]` entry — when true, clipboard data from that peer is applied to this device's clipboard.
 
 Defaults are `false`. Existing pairs see no behavior change on upgrade.
 
 ### Limitations
 
-- **Text only**. No images, files, RTF/HTML, or multi-format pasteboard.
-- **4 KiB max payload** (originator fingerprint + content + length prefixes, conservative against typical UDP MTU). Larger copies are dropped at the sender with a debug log; the local clipboard is unaffected.
-- **UTF-8 only**. Invalid byte sequences are rejected.
+- Current peers negotiate clipboard-v2 and send text up to **32 MiB**, lossless
+  PNG images up to **128 MiB** (with decoded pixel limits), and file trees up to
+  **2 GiB / 10,000 entries** over a
+  separately authenticated, encrypted TCP stream. Mouse/keyboard traffic stays
+  on DTLS and is not queued behind the copy. Legacy peers retain the **4 KiB**
+  DTLS text limit; larger copies are skipped for those peers.
+- File lists use the native clipboard representation on Windows, macOS, and
+  Linux. Symbolic links and special filesystem entries are rejected; received
+  files remain in a private staging directory for as long as the clipboard or
+  an in-flight forwarded transfer references them.
+- Rich text/HTML and arbitrary custom pasteboard formats are not synchronized.
+- Text is UTF-8 only; invalid byte sequences are rejected.
 - Polling-based change detection (no native pasteboard event API exists on macOS), so very rapid recopies within a single poll tick may be coalesced.
 
 ### App-source suppression
@@ -560,7 +569,7 @@ The wire frame carries the originator's TLS certificate fingerprint. The Service
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [x] Clipboard support (text, per-pair, with app-source suppression)
+- [x] Clipboard support (text, images, files, per-pair, with app-source suppression)
 
 
 ## Detailed OS Support
