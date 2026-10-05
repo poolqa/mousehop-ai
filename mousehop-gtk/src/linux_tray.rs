@@ -143,7 +143,7 @@ impl Tray for MousehopTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
             StandardItem {
-                label: "Open Mousehop".into(),
+                label: crate::i18n::tr("Open Mousehop").into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.send_blocking(TrayCmd::TogglePresent);
                 }),
@@ -152,7 +152,7 @@ impl Tray for MousehopTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Quit Mousehop".into(),
+                label: crate::i18n::tr("Quit Mousehop").into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.send_blocking(TrayCmd::Quit);
                 }),

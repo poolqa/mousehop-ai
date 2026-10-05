@@ -103,9 +103,9 @@ impl ObjectImpl for ClipboardPrivacyWindow {
         // Picker title; subtitle gets rendered by the expression
         // (selected app's display name).
         let _ = HostKind::current();
-        self.app_picker.set_title("App");
+        self.app_picker.set_title(crate::i18n::tr("App"));
         self.add_group
-            .set_description(Some("Pick a running app to suppress."));
+            .set_description(Some(crate::i18n::tr("Pick a running app to suppress.")));
 
         // Selected-display: use a closure expression that pulls
         // display_name off the RunningAppObject. Without this the
@@ -245,7 +245,7 @@ impl ClipboardPrivacyWindow {
                 .icon_name("user-trash-symbolic")
                 .valign(gtk::Align::Center)
                 .halign(gtk::Align::Center)
-                .tooltip_text("Remove from suppression list")
+                .tooltip_text(crate::i18n::tr("Remove from suppression list"))
                 .build();
             delete.add_css_class("error");
             let weak_self = self.obj().downgrade();

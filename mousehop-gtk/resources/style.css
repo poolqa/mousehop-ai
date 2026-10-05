@@ -1,0 +1,4 @@
+/* One third of the default 128px software logo, rounded to whole pixels. */
+statuspage.settings-page > scrolledwindow > viewport > box > clamp > box > .icon {
+  -gtk-icon-size: 43px;
+}

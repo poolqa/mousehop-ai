@@ -28,6 +28,9 @@
                 <property name="propagate-natural-height">true</property>
                 <child>
                   <object class="AdwStatusPage">
+                    <style>
+                      <class name="settings-page"/>
+                    </style>
                     <property name="title" translatable="yes">Mousehop</property>
                     <property name="description" translatable="yes">Easily use your mouse and keyboard on multiple computers.</property>
                     <property name="icon-name">com.mousehop.Mousehop</property>
@@ -102,6 +105,21 @@
                     <child>
                       <object class="AdwPreferencesGroup">
                         <property name="title" translatable="yes">General</property>
+                        <child>
+                          <object class="AdwComboRow" id="language_row">
+                            <property name="title">Language</property>
+                            <property name="subtitle">Changes take effect after restarting Mousehop.</property>
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item>System Default</item>
+                                  <item>English</item>
+                                  <item>繁體中文</item>
+                                </items>
+                              </object>
+                            </property>
+                          </object>
+                        </child>
                         <!--
                         <child>
                           <object class="AdwActionRow">

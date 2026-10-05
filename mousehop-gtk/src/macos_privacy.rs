@@ -205,15 +205,15 @@ fn open_url(url: &str) {
 /// `None` (e.g. running outside an `.app` bundle) the `with icon` clause is
 /// omitted and macOS falls back to its default.
 fn relaunch_alert_script(icon_icns: Option<&str>) -> String {
-    let mut script = String::from(concat!(
-        "activate\n",
-        "display dialog \"Accessibility access has been granted. Mousehop ",
-        "needs to quit and reopen for keyboard and mouse capture to take ",
-        "effect.\" ",
-        "with title \"Relaunch Required\" ",
-        "buttons {\"Later\", \"Quit & Reopen\"} ",
-        "default button \"Quit & Reopen\" cancel button \"Later\"",
-    ));
+    let message = crate::i18n::tr(
+        "Accessibility access has been granted. Mousehop needs to quit and reopen for keyboard and mouse capture to take effect.",
+    );
+    let title = crate::i18n::tr("Relaunch Required");
+    let later = crate::i18n::tr("Later");
+    let reopen = crate::i18n::tr("Quit & Reopen");
+    let mut script = format!(
+        "activate\ndisplay dialog {message:?} with title {title:?} buttons {{{later:?}, {reopen:?}}} default button {reopen:?} cancel button {later:?}"
+    );
     if let Some(path) = icon_icns {
         script.push_str(" with icon POSIX file \"");
         script.push_str(path);
@@ -298,7 +298,7 @@ where
         // such line. Anything else (spawn/IO failure) is treated as "Later".
         let relaunch = matches!(
             &result,
-            Ok((Some(stdout), _)) if stdout.contains("Quit & Reopen")
+            Ok((Some(stdout), _)) if stdout.contains(crate::i18n::tr("Quit & Reopen"))
         );
         on_choice(relaunch);
     });

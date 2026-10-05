@@ -4,6 +4,7 @@ mod client_row;
 mod clipboard_privacy_window;
 mod fingerprint_window;
 mod glyph_font;
+mod i18n;
 mod key_object;
 mod key_row;
 #[cfg(target_os = "linux")]
@@ -171,7 +172,13 @@ fn gtk_main() -> glib::ExitCode {
         install_macos_gtk_log_filter();
     }
 
-    gio::resources_register_include!("mousehop.gresource").expect("Failed to register resources.");
+    if i18n::language() == i18n::Language::TraditionalChinese {
+        gio::resources_register_include!("mousehop-zh-TW.gresource")
+            .expect("Failed to register resources.");
+    } else {
+        gio::resources_register_include!("mousehop.gresource")
+            .expect("Failed to register resources.");
+    }
 
     let app = Application::builder()
         .application_id("com.mousehop.Mousehop")
@@ -207,6 +214,7 @@ fn gtk_main() -> glib::ExitCode {
 
     app.connect_startup(|app| {
         load_icons();
+        load_styles();
         configure_text_rendering();
         // Register the bundled chord-chip faces with fontconfig before
         // any window — and so any text layout — is built, so Pango's
@@ -296,6 +304,17 @@ fn load_icons() {
     icon_theme.add_resource_path("/com/mousehop/Mousehop/icons");
 }
 
+fn load_styles() {
+    let display = Display::default().expect("Could not connect to a display.");
+    let provider = gtk::CssProvider::new();
+    provider.load_from_resource("/com/mousehop/Mousehop/style.css");
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 /// Pin font rasterization to the egui/hyprcorrect-equivalent
 /// rendering pipeline so the release-shortcut chip — and incidentally
 /// the rest of the prefs UI — matches hyprcorrect's crispness.
@@ -367,9 +386,9 @@ fn setup_menu(app: &adw::Application) {
     let menu = gio::Menu::new();
 
     let file_menu = gio::Menu::new();
-    file_menu.append(Some("Close Window"), Some("window.close"));
-    file_menu.append(Some("Quit"), Some("app.quit"));
-    menu.append_submenu(Some("_File"), &file_menu);
+    file_menu.append(Some(crate::i18n::tr("Close Window")), Some("window.close"));
+    file_menu.append(Some(crate::i18n::tr("Quit")), Some("app.quit"));
+    menu.append_submenu(Some(crate::i18n::tr("_File")), &file_menu);
 
     app.set_menubar(Some(&menu))
 }

@@ -45,6 +45,21 @@ macOS, and `text/uri-list` on Linux. Bitmaps are normalized to RGBA8 in memory,
 encoded losslessly as PNG for transfer, and decoded only after the offer,
 payload size, dimensions, and digest have passed validation.
 
+## UI localization
+
+`mousehop-gtk/translations/zh-TW.tsv` maps English message keys to Traditional
+Chinese. `mousehop-gtk/build.rs` compiles English and translated GTK resource
+bundles; the frontend registers the selected bundle before initializing any
+composite templates. Runtime labels and native tray menus use the same catalog.
+Missing translations fall back to English. Named placeholders must be retained
+in translated messages. The language preference is local to the frontend and
+requires a restart, so daemon and protocol serialization are unchanged.
+
+To add another language, add a catalog, compile its resource bundle, extend the
+language selection/resolution in `src/i18n.rs`, and register the corresponding
+bundle during frontend startup. Catalog tests check duplicate keys and placeholder
+consistency; resource tests check translated templates and markup.
+
 ## Events
 
 Each instance of mousehop can emit and receive events, where

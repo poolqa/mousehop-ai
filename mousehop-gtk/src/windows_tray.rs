@@ -366,9 +366,31 @@ unsafe fn show_menu(hwnd: HWND) {
     };
 
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN, w!("Open Mousehop"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_OPEN,
+            windows::core::PCWSTR(
+                crate::i18n::tr("Open Mousehop")
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect::<Vec<_>>()
+                    .as_ptr(),
+            ),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT, w!("Quit Mousehop"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_QUIT,
+            windows::core::PCWSTR(
+                crate::i18n::tr("Quit Mousehop")
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect::<Vec<_>>()
+                    .as_ptr(),
+            ),
+        );
 
         // The documented dance (KB135788): a tray menu only dismisses
         // on an outside click while its owner is the foreground

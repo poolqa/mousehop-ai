@@ -57,14 +57,18 @@ impl LockRecoveryWindow {
 
     pub(super) fn set_state(&self, addr: SocketAddr, state: RemoteHostState) {
         let content = recovery_content(state);
-        self.obj().set_title(Some(content.title));
+        self.obj().set_title(Some(crate::i18n::tr(content.title)));
         self.state_icon.set_icon_name(Some(content.icon));
-        self.title_label.set_label(content.title);
-        self.status_label.set_label(content.status);
-        self.instructions_label.set_label(content.instructions);
-        self.assurance_label.set_label(content.assurance);
-        self.peer_label
-            .set_label(&format!("Authenticated status from {addr}"));
+        self.title_label.set_label(crate::i18n::tr(content.title));
+        self.status_label.set_label(crate::i18n::tr(content.status));
+        self.instructions_label
+            .set_label(crate::i18n::tr(content.instructions));
+        self.assurance_label
+            .set_label(crate::i18n::tr(content.assurance));
+        self.peer_label.set_label(&crate::i18n::text(
+            "Authenticated status from {addr}",
+            &[("addr", addr.to_string())],
+        ));
     }
 }
 

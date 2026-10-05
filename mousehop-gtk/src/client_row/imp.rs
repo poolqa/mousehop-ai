@@ -419,7 +419,10 @@ impl ClientRow {
     ) {
         // Fixed leading options. Keep these indices in sync with the
         // selection handler in `constructed`.
-        let mut labels: Vec<String> = vec!["Auto".to_string(), "Fastest".to_string()];
+        let mut labels: Vec<String> = vec![
+            crate::i18n::tr("Auto").to_string(),
+            crate::i18n::tr("Fastest").to_string(),
+        ];
         let lead = labels.len();
         let mut ips: Vec<String> = Vec::with_capacity(entries.len());
         for e in &entries {
@@ -429,7 +432,7 @@ impl ClientRow {
             // kind it's "Wired · <lat>"; without a kind we only append a
             // real measured latency; otherwise just show the address.
             let detail = match iface_label(e.kind) {
-                Some(kind) => format!("{kind} · {}", format_latency(&e.latency)),
+                Some(kind) => format!("{} · {}", crate::i18n::tr(kind), format_latency(&e.latency)),
                 None => match e.latency {
                     LatencyState::Rtt(_) => format_latency(&e.latency),
                     _ => String::new(),
@@ -445,7 +448,10 @@ impl ClientRow {
         // Keep a locked-but-no-longer-a-candidate address visible.
         if let Some(ip) = locked.as_ref() {
             if !ips.iter().any(|x| x == ip) {
-                labels.push(format!("{ip} — locked"));
+                labels.push(crate::i18n::text(
+                    "{ip} — locked",
+                    &[("ip", ip.to_string())],
+                ));
                 ips.push(ip.clone());
             }
         }

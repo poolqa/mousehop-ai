@@ -1,0 +1,145 @@
+Easily use your mouse and keyboard on multiple computers.	輕鬆在多台電腦間共用滑鼠與鍵盤。
+Capture / Emulation Status	輸入擷取／模擬狀態
+Input Capture Disabled	輸入擷取已停用
+Required for outgoing and incoming connections.	傳出與傳入連線皆需要此功能。
+Reenable	重新啟用
+Input Emulation Disabled	輸入模擬已停用
+Required for incoming connections.	傳入連線需要此功能。
+General	一般
+Hostname &amp; Port	主機名稱與連接埠
+<span font_style="italic" font_weight="light" foreground="darkgrey">could not determine hostname</span>	<span font_style="italic" font_weight="light" foreground="darkgrey">無法取得主機名稱</span>
+Certificate Fingerprint	憑證指紋
+Outgoing Auto-Release	傳出控制自動釋放
+Fallback release when the peer can't tell us the cursor reached its edge — typically because the peer's screen is locked. No effect on peers that release themselves; the cursor-release keybind still works either way.	當對端無法回報游標已到達邊緣時（通常是螢幕已鎖定），自動釋放控制。對端可自行釋放時不受影響；釋放游標的快捷鍵隨時可用。
+Release Threshold	釋放門檻
+Pixels of wall-press past the entry edge before auto-release fires.	游標在進入邊緣持續推動多少像素後自動釋放。
+Disabled	已停用
+Outgoing Connections	傳出連線
+Add	新增
+No Connections	尚無連線
+Add a new client via the + button.	按「＋」新增遠端電腦。
+Incoming Connections	傳入連線
+Authorize	授權
+No Devices Registered	尚未登錄裝置
+Authorize a new device via the "Authorize" button.	按「授權」允許新裝置連線。
+Network Discovery	網路探索
+Advertise (and consume) Bonjour records so peers can pick the OS-preferred interface on multi-homed hosts. Turn off on networks where mDNS multicast is firewalled.	發布並接收 Bonjour 記錄，讓對端在多網路介面的主機上選擇系統偏好的介面。若網路封鎖 mDNS 多播，請關閉此功能。
+mDNS Discovery	mDNS 探索
+Use _mousehop._udp.local. for service order hints.	使用 _mousehop._udp.local. 提供服務順序提示。
+Clipboard Privacy	剪貼簿隱私
+Apps in this list never share their clipboard with peers — useful for password managers and other tools whose clipboard you don't want syncing.	清單中的應用程式不會與對端分享剪貼簿，適用於密碼管理工具或其他不想同步的應用程式。
+Suppressed Apps	停用分享的應用程式
+0 apps	0 個應用程式
+1 app	1 個應用程式
+Manage	管理
+Release Shortcut	釋放快捷鍵
+Hold this chord to release the cursor back to this host while another peer has captured it. Click the chip and press a new combination to change it.	當其他電腦擷取游標時，按住此組合鍵可將控制權交還本機。點選按鍵標籤並按下新組合鍵即可變更。
+Release Mouse	釋放滑鼠
+Default: Ctrl + Shift + Alt + Super.	預設：Ctrl + Shift + Alt + Super。
+Click and press a key combination to set the release chord. Escape cancels.	點選後按下組合鍵以設定釋放快捷鍵，按 Escape 取消。
+About	關於
+Version	版本
+Copy full version details	複製完整版本資訊
+Built	建置資訊
+Source	原始碼
+Unauthorized Device	未授權的裝置
+An unauthorized Device is trying to connect. Do you want to authorize this Device?	未授權的裝置正在嘗試連線。是否授權此裝置？
+SHA-256 Fingerprint	SHA-256 指紋
+Cancel	取消
+Mac is locked	Mac 已鎖定
+Waiting for confirmed unlock…	等待確認解鎖…
+Hide	隱藏
+Hide this guidance; it does not change the Mac’s lock state	隱藏此提示，不會變更 Mac 的鎖定狀態
+Fingerprint	指紋
+Copy fingerprint to clipboard	將指紋複製到剪貼簿
+Natural Scrolling	自然捲動
+Invert the direction of forwarded scroll events.	反轉轉送的捲動方向。
+Mouse Sensitivity	滑鼠靈敏度
+Adjust the speed of forwarded mouse movement.	調整轉送的滑鼠移動速度。
+Accept Clipboard From This Peer	接收此對端的剪貼簿
+Apply text this peer copies to your clipboard.	將此對端複製的文字套用至本機剪貼簿。
+Revoke Authorization	撤銷授權
+Revoke authorization	撤銷授權
+When the frontmost app on this device matches an entry below, its clipboard contents will not be broadcast to peers.	當本機前景應用程式符合下列項目時，不會將其剪貼簿內容傳送給對端。
+No apps suppressed yet — add one below.	尚未設定停用分享的應用程式，請於下方新增。
+Add an App	新增應用程式
+Running App	執行中的應用程式
+Add to Suppression List	加入停用分享清單
+Hostname	主機名稱
+Enable	啟用
+Resolve host	解析主機位址
+IP address or DNS hostname	IP 位址或 DNS 主機名稱
+Port	連接埠
+Position	位置
+Where this device sits relative to your screen.	此裝置相對於本機螢幕的位置。
+Left	左側
+Right	右側
+Top	上方
+Bottom	下方
+Require Modifier to Cross	跨越邊緣時需要輔助鍵
+Keep this edge local unless the selected modifier is held.	只有按住指定輔助鍵時，才能跨越此邊緣。
+Crossing Modifier	跨越邊緣輔助鍵
+Either the left or right key will allow the crossing.	左側或右側的同名按鍵皆可使用。
+Control	Control
+Alt / Option	Alt／Option
+Shift	Shift
+Super / Command / Windows	Super／Command／Windows
+Connection Address	連線位址
+Auto races all addresses; Fastest sticks to the lowest-latency one; or pin a specific address on this network.	「自動」同時嘗試所有位址；「最快」使用延遲最低的位址；也可固定使用此網路上的特定位址。
+Auto	自動
+Fastest	最快
+Use Command as Control	將 Command 視為 Control
+Send Command as Control when this Mac controls this peer. Useful for Windows and Linux peers.	此 Mac 控制對端時，將 Command 轉送為 Control，適用於 Windows 與 Linux。
+Share Clipboard With This Peer	與此對端分享剪貼簿
+When you copy text on this device, send it to this peer.	在本機複製文字時，將文字傳送給此對端。
+Delete This Client	刪除此遠端電腦
+Add Certificate Fingerprint	新增憑證指紋
+The certificate fingerprint serves as a unique identifier for your device.	憑證指紋是裝置的唯一識別碼。
+You can find it under the `General` section of the device you want to connect.	可在欲連線裝置的「一般」區段中找到。
+Description	說明
+Confirm	確認
+Language	語言
+System Default	跟隨系統
+Changes take effect after restarting Mousehop.	重新啟動 Mousehop 後套用語言設定。
+Language saved. Restart Mousehop to apply.	已儲存語言設定，請重新啟動 Mousehop 套用。
+Could not save language preference.	無法儲存語言設定。
+Open Mousehop	開啟 Mousehop
+Quit Mousehop	結束 Mousehop
+Close Window	關閉視窗
+Quit	結束
+_File	檔案
+App	應用程式
+Pick a running app to suppress.	選擇要停用剪貼簿分享的執行中應用程式。
+Remove from suppression list	從停用分享清單移除
+Relaunch Required	需要重新啟動
+Accessibility granted — restart to activate capture and emulation.	已取得輔助使用權限，請重新啟動以啟用輸入擷取與模擬。
+Relaunch	重新啟動
+Grant accessibility permission to enable.	請授予輔助使用權限以啟用。
+Grant	授予權限
+Click to set	點選以設定
+<span foreground="#9fbef0" style="italic">Press a shortcut…</span>	<span foreground="#9fbef0" style="italic">請按下快捷鍵…</span>
+no ip addresses associated with this client	此遠端電腦尚無 IP 位址
+<span font_style="italic" font_weight="light" foreground="darkgrey">No Hostname</span>	<span font_style="italic" font_weight="light" foreground="darkgrey">無主機名稱</span>
+Mac unlocked. Move across the configured screen edge to resume forwarding.	Mac 已解鎖，將游標移過設定的螢幕邊緣即可重新轉送輸入。
+Mousehop paused forwarding and returned the keyboard to the Mac. Use the keyboard physically attached to the Mac: press Shift once to wake it without entering a character, then wait. If this window still says locked, type your Mac password and press Return.	Mousehop 已暫停轉送，並將鍵盤控制權交還 Mac。請使用實際連接 Mac 的鍵盤：先按一次 Shift 喚醒螢幕，避免輸入字元，然後稍候。若視窗仍顯示已鎖定，請在 Mac 輸入密碼並按 Return。
+Nothing is entered here. Mousehop never reads, stores, or sends your password.	此處不接受任何輸入。Mousehop 不會讀取、儲存或傳送您的密碼。
+Mac status unavailable	無法取得 Mac 狀態
+Mousehop can no longer confirm the Mac’s lock state. Do not type your password while this message is shown. Switch the monitor to the Mac, use Touch ID or Apple Watch, or use your hardware input switch.	Mousehop 無法確認 Mac 的鎖定狀態。顯示此訊息時請勿輸入密碼。請將螢幕切換至 Mac、使用 Touch ID 或 Apple Watch，或切換硬體輸入裝置。
+Mousehop will never ask for or transmit your Mac password.	Mousehop 不會要求或傳送您的 Mac 密碼。
+Waiting for the Mac to reconnect…	等待 Mac 重新連線…
+Mac is unlocked	Mac 已解鎖
+Move the pointer across the configured screen edge to start a new forwarding session.	將游標移過設定的螢幕邊緣，即可開始新的輸入轉送工作階段。
+The previous capture was not resumed automatically.	先前的輸入擷取不會自動恢復。
+Confirmed unlocked	已確認解鎖
+Wired	有線網路
+Wi-Fi	Wi-Fi
+Unknown	未知
+{n} apps	{n} 個應用程式
+Authenticated status from {addr}	來自 {addr} 的已驗證狀態
+{ip} — locked	{ip} — 已固定
+<span foreground="#ffaa33">Peer version: unknown · Ours: {local}</span>	<span foreground="#ffaa33">對端版本：未知 · 本機：{local}</span>
+<span foreground="#33cc66">Peer version: {p} · matched</span>	<span foreground="#33cc66">對端版本：{p} · 相同</span>
+<span foreground="#ffaa33">Peer version: {p} · Ours: {local}</span>	<span foreground="#ffaa33">對端版本：{p} · 本機：{local}</span>
+Accessibility access has been granted. Mousehop needs to quit and reopen for keyboard and mouse capture to take effect.	已取得輔助使用權限。請結束並重新開啟 Mousehop，讓鍵盤與滑鼠擷取功能生效。
+Later	稍後
+Quit & Reopen	結束並重新開啟

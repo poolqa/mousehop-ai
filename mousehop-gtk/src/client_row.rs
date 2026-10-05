@@ -14,7 +14,7 @@ const NO_HOSTNAME_MARKUP: &str =
 fn collapsed_title(hostname: Option<String>, port: u32) -> String {
     match hostname.as_deref() {
         Some(h) if !h.is_empty() => format!("{h}:{port}"),
-        _ => NO_HOSTNAME_MARKUP.to_string(),
+        _ => crate::i18n::tr(NO_HOSTNAME_MARKUP).to_string(),
     }
 }
 
@@ -127,7 +127,7 @@ impl ClientRow {
             .bind_property("ips", &self.imp().dns_button.get(), "tooltip-text")
             .transform_to(|_, ips: Vec<String>| {
                 if ips.is_empty() {
-                    Some("no ip addresses associated with this client".into())
+                    Some(crate::i18n::tr("no ip addresses associated with this client").into())
                 } else {
                     Some(ips.join("\n"))
                 }
@@ -305,15 +305,18 @@ impl ClientRow {
             .and_then(|co| co.property::<Option<String>>("peer-commit"));
         let local = crate::local_commit_str();
         let markup = match peer.as_deref() {
-            None => format!(
-                r##"<span foreground="#ffaa33">Peer version: unknown · Ours: {local}</span>"##
+            None => crate::i18n::text(
+                r##"<span foreground="#ffaa33">Peer version: unknown · Ours: {local}</span>"##,
+                &[("local", local.clone())],
             ),
-            Some(p) if p == local.as_str() => {
-                format!(r##"<span foreground="#33cc66">Peer version: {p} · matched</span>"##)
-            }
-            Some(p) => {
-                format!(r##"<span foreground="#ffaa33">Peer version: {p} · Ours: {local}</span>"##)
-            }
+            Some(p) if p == local.as_str() => crate::i18n::text(
+                r##"<span foreground="#33cc66">Peer version: {p} · matched</span>"##,
+                &[("p", p.to_owned())],
+            ),
+            Some(p) => crate::i18n::text(
+                r##"<span foreground="#ffaa33">Peer version: {p} · Ours: {local}</span>"##,
+                &[("p", p.to_owned()), ("local", local.clone())],
+            ),
         };
         self.set_subtitle(&markup);
     }

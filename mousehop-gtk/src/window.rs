@@ -625,9 +625,9 @@ impl Window {
         imp.suppressed_apps.replace(apps.clone());
         let count = apps.len();
         let subtitle = match count {
-            0 => "0 apps".to_owned(),
-            1 => "1 app".to_owned(),
-            n => format!("{n} apps"),
+            0 => crate::i18n::tr("0 apps").to_owned(),
+            1 => crate::i18n::tr("1 app").to_owned(),
+            n => crate::i18n::text("{n} apps", &[("n", n.to_string())]),
         };
         imp.clipboard_privacy_row.set_subtitle(&subtitle);
         if let Some(window) = imp.clipboard_privacy_window.borrow().as_ref() {
@@ -820,7 +820,7 @@ impl Window {
             scale.unblock_signal(id);
         }
         let label = if threshold == 0 {
-            "Disabled".to_string()
+            crate::i18n::tr("Disabled").to_string()
         } else {
             format!("{threshold} px")
         };
@@ -873,14 +873,16 @@ impl Window {
             // AX granted but capture/emulation still off → the backends
             // were created without permission and need a fresh process to
             // re-initialize with the new grant in place.
-            row.set_title("Relaunch Required");
-            row.set_subtitle("Accessibility granted — restart to activate capture and emulation.");
-            set_button_content_label(button, "Relaunch");
+            row.set_title(crate::i18n::tr("Relaunch Required"));
+            row.set_subtitle(crate::i18n::tr(
+                "Accessibility granted — restart to activate capture and emulation.",
+            ));
+            set_button_content_label(button, crate::i18n::tr("Relaunch"));
         } else {
             // AX missing → send the user to System Settings.
-            row.set_title("Input Capture Disabled");
-            row.set_subtitle("Grant accessibility permission to enable.");
-            set_button_content_label(button, "Grant");
+            row.set_title(crate::i18n::tr("Input Capture Disabled"));
+            row.set_subtitle(crate::i18n::tr("Grant accessibility permission to enable."));
+            set_button_content_label(button, crate::i18n::tr("Grant"));
         }
     }
 
@@ -1021,9 +1023,9 @@ impl Window {
                 if let Some(window) = imp.lock_recovery_window.borrow_mut().take() {
                     window.close();
                 }
-                self.show_toast(
+                self.show_toast(crate::i18n::tr(
                     "Mac unlocked. Move across the configured screen edge to resume forwarding.",
-                );
+                ));
             }
             return;
         }

@@ -367,6 +367,17 @@ mousehop daemon
 ```
 </details>
 
+### Interface language
+
+The GTK interface includes English and Traditional Chinese (繁體中文). Choose
+**General → Language** (一般 → 語言): **System Default**, **English**, or
+**繁體中文**, then restart Mousehop. The preference is saved in
+`mousehop/language` under the OS user configuration directory, independently of
+peer settings. System Default selects Traditional Chinese for `zh-Hant`,
+Taiwan, Hong Kong, and Macao locales; other languages fall back to English.
+Settings, authorization dialogs, clipboard privacy, recovery guidance, and tray
+menus use the selected language. CLI output and diagnostic logs remain English.
+
 ### Modifier key recovery
 
 On macOS and Windows, an incoming modifier snapshot releases tracked modifier

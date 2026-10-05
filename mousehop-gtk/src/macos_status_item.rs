@@ -53,9 +53,15 @@ pub fn setup(app: &adw::Application, window: &Window) {
 
             let delegate = new_delegate();
             let menu = menu(&[
-                menu_item(c"Open Mousehop", c"showMousehop:"),
+                menu_item(
+                    &CString::new(crate::i18n::tr("Open Mousehop")).unwrap(),
+                    c"showMousehop:",
+                ),
                 separator_item(),
-                menu_item(c"Quit Mousehop", c"quitMousehop:"),
+                menu_item(
+                    &CString::new(crate::i18n::tr("Quit Mousehop")).unwrap(),
+                    c"quitMousehop:",
+                ),
             ]);
 
             let status_bar = msg_send_id(class(c"NSStatusBar"), sel(c"systemStatusBar"));

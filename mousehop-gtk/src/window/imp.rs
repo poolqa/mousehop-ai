@@ -19,6 +19,8 @@ use crate::lock_recovery_window::LockRecoveryWindow;
 #[template(resource = "/com/mousehop/Mousehop/window.ui")]
 pub struct Window {
     #[template_child]
+    pub language_row: TemplateChild<adw::ComboRow>,
+    #[template_child]
     pub authorized_placeholder: TemplateChild<ActionRow>,
     #[template_child]
     pub fingerprint_row: TemplateChild<ActionRow>,
@@ -295,6 +297,26 @@ impl ObjectImpl for Window {
         }
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);
+        self.language_row
+            .set_selected(crate::i18n::preference().index());
+        let weak = self.obj().downgrade();
+        self.language_row.connect_selected_notify(move |row| {
+            let preference = match row.selected() {
+                1 => crate::i18n::Language::English,
+                2 => crate::i18n::Language::TraditionalChinese,
+                _ => crate::i18n::Language::System,
+            };
+            if let Some(window) = weak.upgrade() {
+                let message = match crate::i18n::save(preference) {
+                    Ok(()) => crate::i18n::tr("Language saved. Restart Mousehop to apply."),
+                    Err(error) => {
+                        log::warn!("could not save language preference: {error}");
+                        crate::i18n::tr("Could not save language preference.")
+                    }
+                };
+                window.show_toast(message);
+            }
+        });
         let obj = self.obj();
         obj.setup_icon();
         obj.setup_clients();
@@ -310,7 +332,7 @@ impl ObjectImpl for Window {
             move |scale| {
                 let value = scale.value().round() as u32;
                 let label = if value == 0 {
-                    "Disabled".to_string()
+                    crate::i18n::tr("Disabled").to_string()
                 } else {
                     format!("{value} px")
                 };

@@ -90,7 +90,7 @@ const CHIP_SEPARATOR: &str = "\u{2004}";
 /// where the font lookup failed.
 pub fn chord_markup(keys: &[scancode::Linux]) -> String {
     if keys.is_empty() {
-        return escape("Click to set").to_string();
+        return escape(crate::i18n::tr("Click to set")).to_string();
     }
 
     let (mods, trigger) = split_chord(keys);
@@ -119,7 +119,7 @@ pub fn chord_markup(keys: &[scancode::Linux]) -> String {
 /// Build the Pango markup shown while we're waiting for the user to
 /// press a chord.
 pub fn capturing_markup() -> &'static str {
-    "<span foreground=\"#9fbef0\" style=\"italic\">Press a shortcut…</span>"
+    crate::i18n::tr("<span foreground=\"#9fbef0\" style=\"italic\">Press a shortcut…</span>")
 }
 
 /// Wire up a chord-capture button: clicking flips into capture mode,
