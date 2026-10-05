@@ -1,21 +1,9 @@
 use super::{Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
-use core_foundation::base::{CFRelease, TCFType, kCFAllocatorDefault};
-use core_foundation::string::{
-    CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8,
-};
-use core_foundation_sys::array::{
-    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef,
-};
-use core_foundation_sys::base::{Boolean, CFGetTypeID, CFTypeRef, OSStatus};
-use core_foundation_sys::dictionary::{
-    CFDictionaryGetTypeID, CFDictionaryGetValue, CFDictionaryRef,
-};
-use core_foundation_sys::number::{
-    CFBooleanGetValue, CFBooleanRef, CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type,
-};
-use core_foundation_sys::string::CFStringGetTypeID;
+use core_foundation::base::{CFRelease, kCFAllocatorDefault};
+use core_foundation::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
+use core_foundation_sys::number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type};
 use core_graphics::base::CGFloat;
 use core_graphics::display::{CGDisplay, CGPoint};
 use core_graphics::event::{
@@ -31,9 +19,10 @@ use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::ptr;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::error::MacOSEmulationCreationError;
@@ -129,6 +118,9 @@ pub(crate) struct MacOSEmulation {
     repeat_key: Option<CGKeyCode>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
+    /// Keys pressed with a shortcut modifier must use Quartz for their whole
+    /// down/repeat/up sequence, even if the modifier is released first.
+    quartz_modified_keys: HashSet<CGKeyCode>,
     /// button previously pressed (evdev button code)
     previous_button: Option<u32>,
     /// timestamp of previous click (button down)
@@ -137,16 +129,11 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// A Windows keyboard reports Caps Lock as an ordinary down/up pair. Keep
-    /// the physical phase so one completed press switches input source once.
-    caps_lock_pressed: bool,
-    /// Most recently observed non-ASCII input source. This mirrors macOS's
-    /// "switch to and from the last used Latin input source" behavior while
-    /// retaining the user's non-Latin side of the pair.
-    last_non_ascii_input_source: Option<String>,
-    /// Whether this Mac has an enabled non-ASCII input source. Without one,
-    /// preserve ordinary Caps Lock behavior instead of swallowing the key.
-    caps_lock_input_source_mode: bool,
+    /// Used only to keep a synthetic Control+Space key-up pair out of the
+    /// same WindowServer event batch. This does not represent input-source
+    /// state.
+    last_control_release: Option<Instant>,
+    last_space_release: Option<Instant>,
     /// Exact physical source keys behind the aggregate modifier mask. macOS
     /// exposes left/right key codes independently, so releasing one side must
     /// not clear Shift/Control/Option/Command while its peer remains held.
@@ -234,58 +221,33 @@ impl MacOSEmulation {
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
+            quartz_modified_keys: HashSet::new(),
             previous_button: None,
             previous_button_click: None,
             button_click_state: 0,
             repeat_task: None,
             repeat_key: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
-            caps_lock_pressed: false,
-            last_non_ascii_input_source: current_non_ascii_input_source_id(),
-            caps_lock_input_source_mode: has_non_ascii_input_source(),
+            last_control_release: None,
+            last_space_release: None,
             physical_modifiers: Cell::new(PhysicalModifiers::empty()),
             user_activity_assertion: Cell::new(0),
             display_union_cache: Cell::new(None),
         })
     }
 
-    async fn handle_caps_lock(&mut self, state: u8) {
-        if !self.caps_lock_input_source_mode {
-            if state == 1 {
-                const MAC_CAPS_LOCK_KEYCODE: CGKeyCode = 0x39;
-                key_event(
-                    self.event_source.clone(),
-                    MAC_CAPS_LOCK_KEYCODE,
-                    1,
-                    self.modifier_state.get(),
-                );
-                key_event(
-                    self.event_source.clone(),
-                    MAC_CAPS_LOCK_KEYCODE,
-                    0,
-                    self.modifier_state.get(),
-                );
-                toggle_caps_lock(&self.modifier_state);
-            }
-            return;
+    fn handle_caps_lock(&self, state: u8) -> Option<oneshot::Receiver<()>> {
+        if state != 1 {
+            return None;
         }
-        if !caps_lock_press_completed(&mut self.caps_lock_pressed, state) {
-            return;
-        }
-        match switch_caps_lock_input_source(&mut self.last_non_ascii_input_source) {
-            Ok((from, to)) => {
-                // TIS selection is delivered through macOS's text-input
-                // service. Preserve wire order by waiting briefly for that
-                // service to publish the new source before accepting the next
-                // remotely typed character.
-                if wait_for_input_source(&to).await {
-                    log::debug!("Caps Lock switched input source: {from} -> {to}");
-                } else {
-                    log::warn!("Caps Lock selected {to}, but macOS did not activate it in time");
-                }
-            }
-            Err(error) => log::warn!("Caps Lock could not switch input source: {error}"),
-        }
+        let event_source = self.event_source.clone();
+        let modifiers = self.modifier_state.get();
+        let (done_tx, done_rx) = oneshot::channel();
+        tokio::task::spawn_local(async move {
+            post_input_source_shortcut(event_source, modifiers).await;
+            let _ = done_tx.send(());
+        });
+        Some(done_rx)
     }
 
     /// Tell the macOS power-manager that real user input is arriving
@@ -388,8 +350,21 @@ impl MacOSEmulation {
         // there can only be one repeating key and it's
         // always the last to be pressed
         self.cancel_repeat_task().await;
+        let modifiers = self.modifier_state.get();
+        let force_quartz = self.quartz_modified_keys.contains(&key)
+            || (uses_hid_ime_path(key) && has_shortcut_modifier(modifiers));
+        if force_quartz {
+            self.quartz_modified_keys.insert(key);
+        }
         // initial key event
-        key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
+        post_key_event(
+            self.event_source.clone(),
+            key,
+            1,
+            modifiers,
+            false,
+            force_quartz,
+        );
         // Use the host's own keyboard repeat settings so forwarded keys
         // feel identical to typing directly on this Mac, rather than a
         // fixed hardcoded rate.
@@ -400,7 +375,14 @@ impl MacOSEmulation {
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(repeat_delay).await;
             loop {
-                key_event(event_source.clone(), key, 1, modifiers.get());
+                post_key_event(
+                    event_source.clone(),
+                    key,
+                    1,
+                    modifiers.get(),
+                    true,
+                    force_quartz,
+                );
                 tokio::time::sleep(repeat_interval).await;
             }
         });
@@ -414,7 +396,14 @@ impl MacOSEmulation {
             let _ = task.await;
         }
         if let Some(key) = self.repeat_key.take() {
-            key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
+            post_key_event(
+                self.event_source.clone(),
+                key,
+                0,
+                self.modifier_state.get(),
+                false,
+                self.quartz_modified_keys.contains(&key),
+            );
         }
     }
 
@@ -425,8 +414,16 @@ impl MacOSEmulation {
             // Pressing a second character ends repeat for the first one and
             // emits its synthetic key-up. Its later physical key-up still
             // needs to pass through, but must not cancel the second key.
-            key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
+            post_key_event(
+                self.event_source.clone(),
+                key,
+                0,
+                self.modifier_state.get(),
+                false,
+                self.quartz_modified_keys.contains(&key),
+            );
         }
+        self.quartz_modified_keys.remove(&key);
     }
 }
 
@@ -508,281 +505,49 @@ extern "C" {
         user_type: c_int,
         out_id: *mut u32,
     ) -> i32;
+    fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+    fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+    fn IOServiceOpen(service: u32, owning_task: u32, connect_type: u32, connect: *mut u32) -> i32;
+    fn IOObjectRelease(object: u32) -> i32;
+    fn IOHIDPostEvent(
+        connect: u32,
+        event_type: u32,
+        location: IOGPoint,
+        event_data: *const NXKeyEventData,
+        event_data_version: u32,
+        event_flags: u32,
+        options: u32,
+    ) -> i32;
 }
 
-type TISInputSourceRef = *mut c_void;
-
-#[link(name = "Carbon", kind = "framework")]
-extern "C" {
-    fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
-    fn TISCopyCurrentASCIICapableKeyboardInputSource() -> TISInputSourceRef;
-    fn TISCreateInputSourceList(
-        properties: CFDictionaryRef,
-        include_all_installed: Boolean,
-    ) -> CFArrayRef;
-    fn TISGetInputSourceProperty(
-        input_source: TISInputSourceRef,
-        property_key: CFStringRef,
-    ) -> *const c_void;
-    fn TISSelectInputSource(input_source: TISInputSourceRef) -> OSStatus;
-
-    static kTISPropertyInputSourceID: CFStringRef;
-    static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
-    static kTISPropertyInputSourceIsSelectCapable: CFStringRef;
+unsafe extern "C" {
+    static mach_task_self_: u32;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InputSourceDescriptor {
-    id: String,
-    ascii_capable: bool,
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct IOGPoint {
+    x: i32,
+    y: i32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum InputSourceHistoryKey {
-    Id(String),
-    KeyboardLayoutName(String),
-}
-
-fn input_source_descriptor(source: TISInputSourceRef) -> Option<InputSourceDescriptor> {
-    if source.is_null() {
-        return None;
-    }
-    unsafe {
-        let id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) as CFStringRef;
-        if id.is_null() {
-            return None;
-        }
-        let id = CFString::wrap_under_get_rule(id).to_string();
-        let ascii = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable)
-            as CFBooleanRef;
-        Some(InputSourceDescriptor {
-            id,
-            ascii_capable: !ascii.is_null() && CFBooleanGetValue(ascii),
-        })
-    }
-}
-
-fn input_source_is_selectable(source: TISInputSourceRef) -> bool {
-    unsafe {
-        let selectable = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable)
-            as CFBooleanRef;
-        !selectable.is_null() && CFBooleanGetValue(selectable)
-    }
-}
-
-fn with_current_input_source<T>(f: impl FnOnce(TISInputSourceRef) -> T) -> Option<T> {
-    unsafe {
-        let source = TISCopyCurrentKeyboardInputSource();
-        if source.is_null() {
-            return None;
-        }
-        let result = f(source);
-        CFRelease(source as CFTypeRef);
-        Some(result)
-    }
-}
-
-fn current_non_ascii_input_source_id() -> Option<String> {
-    with_current_input_source(input_source_descriptor)
-        .flatten()
-        .filter(|source| !source.ascii_capable)
-        .map(|source| source.id)
-}
-
-fn has_non_ascii_input_source() -> bool {
-    enabled_selectable_input_sources()
-        .is_ok_and(|sources| sources.iter().any(|source| !source.ascii_capable))
-}
-
-fn current_input_source_id() -> Option<String> {
-    with_current_input_source(input_source_descriptor)
-        .flatten()
-        .map(|source| source.id)
-}
-
-fn caps_lock_press_completed(pressed: &mut bool, state: u8) -> bool {
-    match state {
-        1 => {
-            *pressed = true;
-            false
-        }
-        0 => std::mem::take(pressed),
-        _ => false,
-    }
-}
-
-async fn wait_for_input_source(expected_id: &str) -> bool {
-    const ATTEMPTS: usize = 50;
-    const POLL_INTERVAL: Duration = Duration::from_millis(5);
-    for _ in 0..ATTEMPTS {
-        if current_input_source_id().as_deref() == Some(expected_id) {
-            return true;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-    false
-}
-
-fn choose_non_ascii_input_source(
-    sources: &[InputSourceDescriptor],
-    preferred_id: Option<&str>,
-    history: &[InputSourceHistoryKey],
-) -> Option<String> {
-    let candidates = sources
-        .iter()
-        .filter(|source| !source.ascii_capable)
-        .collect::<Vec<_>>();
-    if let Some(source) =
-        preferred_id.and_then(|id| candidates.iter().find(|source| source.id == id).copied())
-    {
-        return Some(source.id.clone());
-    }
-    for entry in history {
-        let matched = candidates.iter().find(|source| match entry {
-            InputSourceHistoryKey::Id(id) => source.id == *id,
-            InputSourceHistoryKey::KeyboardLayoutName(name) => source
-                .id
-                .strip_prefix("com.apple.keylayout.")
-                .is_some_and(|suffix| suffix == name),
-        });
-        if let Some(source) = matched {
-            return Some(source.id.clone());
-        }
-    }
-    (candidates.len() == 1).then(|| candidates[0].id.clone())
-}
-
-fn cf_string(value: *const c_void) -> Option<String> {
-    if value.is_null() || unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
-        return None;
-    }
-    Some(unsafe { CFString::wrap_under_get_rule(value as CFStringRef) }.to_string())
-}
-
-fn input_source_history() -> Vec<InputSourceHistoryKey> {
-    unsafe {
-        let key = CFString::new("AppleInputSourceHistory");
-        let app = CFString::new("com.apple.HIToolbox");
-        let value = CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), app.as_concrete_TypeRef());
-        if value.is_null() || CFGetTypeID(value) != CFArrayGetTypeID() {
-            if !value.is_null() {
-                CFRelease(value);
-            }
-            return Vec::new();
-        }
-
-        let input_mode_key = CFString::new("Input Mode");
-        let bundle_id_key = CFString::new("Bundle ID");
-        let layout_name_key = CFString::new("KeyboardLayout Name");
-        let list = value as CFArrayRef;
-        let mut history = Vec::new();
-        for index in 0..CFArrayGetCount(list) {
-            let entry = CFArrayGetValueAtIndex(list, index);
-            if entry.is_null() || CFGetTypeID(entry) != CFDictionaryGetTypeID() {
-                continue;
-            }
-            let dict = entry as CFDictionaryRef;
-            let exact_id = cf_string(CFDictionaryGetValue(
-                dict,
-                input_mode_key.as_concrete_TypeRef() as *const c_void,
-            ))
-            .or_else(|| {
-                cf_string(CFDictionaryGetValue(
-                    dict,
-                    bundle_id_key.as_concrete_TypeRef() as *const c_void,
-                ))
-            });
-            if let Some(id) = exact_id {
-                history.push(InputSourceHistoryKey::Id(id));
-            } else if let Some(name) = cf_string(CFDictionaryGetValue(
-                dict,
-                layout_name_key.as_concrete_TypeRef() as *const c_void,
-            )) {
-                history.push(InputSourceHistoryKey::KeyboardLayoutName(name));
-            }
-        }
-        CFRelease(value);
-        history
-    }
-}
-
-fn select_input_source_by_id(id: &str) -> Result<(), String> {
-    unsafe {
-        // `false` returns enabled sources only. Filtering select-capable
-        // entries avoids parent input methods and palettes that Carbon cannot
-        // make the active keyboard source.
-        let list = TISCreateInputSourceList(ptr::null(), false as Boolean);
-        if list.is_null() {
-            return Err("macOS returned no enabled input-source list".into());
-        }
-        let mut status = None;
-        for index in 0..CFArrayGetCount(list) {
-            let source = CFArrayGetValueAtIndex(list, index) as TISInputSourceRef;
-            if input_source_is_selectable(source)
-                && input_source_descriptor(source).is_some_and(|source| source.id == id)
-            {
-                status = Some(TISSelectInputSource(source));
-                break;
-            }
-        }
-        CFRelease(list as CFTypeRef);
-        match status {
-            Some(0) => Ok(()),
-            Some(code) => Err(format!("TISSelectInputSource failed with status {code}")),
-            None => Err(format!("input source {id} is not enabled or selectable")),
-        }
-    }
-}
-
-fn enabled_selectable_input_sources() -> Result<Vec<InputSourceDescriptor>, String> {
-    unsafe {
-        let list = TISCreateInputSourceList(ptr::null(), false as Boolean);
-        if list.is_null() {
-            return Err("macOS returned no enabled input-source list".into());
-        }
-        let mut result = Vec::new();
-        for index in 0..CFArrayGetCount(list) {
-            let source = CFArrayGetValueAtIndex(list, index) as TISInputSourceRef;
-            if input_source_is_selectable(source) {
-                if let Some(source) = input_source_descriptor(source) {
-                    result.push(source);
-                }
-            }
-        }
-        CFRelease(list as CFTypeRef);
-        Ok(result)
-    }
-}
-
-fn switch_caps_lock_input_source(
-    last_non_ascii: &mut Option<String>,
-) -> Result<(String, String), String> {
-    let current = with_current_input_source(input_source_descriptor)
-        .flatten()
-        .ok_or_else(|| "macOS returned no current keyboard input source".to_owned())?;
-
-    let target = if current.ascii_capable {
-        let sources = enabled_selectable_input_sources()?;
-        let history = input_source_history();
-        choose_non_ascii_input_source(&sources, last_non_ascii.as_deref(), &history)
-            .ok_or_else(|| "no enabled non-ASCII input source is selectable".to_owned())?
-    } else {
-        *last_non_ascii = Some(current.id.clone());
-        unsafe {
-            let source = TISCopyCurrentASCIICapableKeyboardInputSource();
-            if source.is_null() {
-                return Err("macOS returned no ASCII-capable input source".into());
-            }
-            let target = input_source_descriptor(source)
-                .map(|source| source.id)
-                .ok_or_else(|| "ASCII-capable input source has no identifier".to_owned());
-            CFRelease(source as CFTypeRef);
-            target?
-        }
-    };
-
-    select_input_source_by_id(&target)?;
-    Ok((current.id, target))
+// Keyboard member of the legacy NXEventData union used by IOHIDPostEvent.
+// Keep the full 48-byte layout: IOKit reads the union by ABI, not by Rust type.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NXKeyEventData {
+    orig_char_set: u16,
+    repeat: i16,
+    char_set: u16,
+    char_code: u16,
+    key_code: u16,
+    orig_char_code: u16,
+    reserved1: i32,
+    keyboard_type: u32,
+    reserved2: i32,
+    reserved3: i32,
+    reserved4: i32,
+    reserved5: [i32; 4],
 }
 
 /// `kIOPMUserActiveLocal` — local mouse / keyboard activity (the
@@ -791,7 +556,165 @@ fn switch_caps_lock_input_source(
 /// here since we ARE the source generating local HID-style input).
 const K_IOPM_USER_ACTIVE_LOCAL: c_int = 0;
 
+const INPUT_SOURCE_KEY_UP_GAP: Duration = Duration::from_millis(20);
+const KEYBOARD_EVENT_TAP_LOCATION: CGEventTapLocation = CGEventTapLocation::HID;
+const MAC_RETURN_KEYCODE: CGKeyCode = 0x24;
+const MAC_KEYPAD_ENTER_KEYCODE: CGKeyCode = 0x4c;
+const MAC_ESCAPE_KEYCODE: CGKeyCode = 0x35;
+
+fn uses_hid_ime_path(key: CGKeyCode) -> bool {
+    matches!(
+        key,
+        MAC_RETURN_KEYCODE | MAC_KEYPAD_ENTER_KEYCODE | MAC_ESCAPE_KEYCODE
+    ) || is_letter_keycode(key)
+}
+
+fn has_shortcut_modifier(modifiers: XMods) -> bool {
+    modifiers.intersects(
+        XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask | XMods::Mod5Mask,
+    )
+}
+
+fn is_letter_keycode(key: CGKeyCode) -> bool {
+    // ANSI A-Z virtual keycodes from HIToolbox/Events.h. Keep letters in the
+    // same input layer as Return and Escape so an IME can resume composition
+    // immediately after a Quartz keypad event.
+    matches!(
+        key,
+        0x00..=0x09 | 0x0b..=0x11 | 0x1f | 0x20 | 0x22 | 0x23 | 0x25 | 0x26 | 0x28 | 0x2d | 0x2e
+    )
+}
+
+fn is_keypad_keycode(key: CGKeyCode) -> bool {
+    // kVK_ANSI_Keypad* from HIToolbox/Events.h.
+    matches!(
+        key,
+        0x41 | 0x43 | 0x45 | 0x47 | 0x4b | 0x4c | 0x4e | 0x51..=0x59 | 0x5b | 0x5c
+    )
+}
+
+fn hid_event_driver() -> Option<u32> {
+    const IO_HID_SYSTEM_CLASS: &[u8] = b"IOHIDSystem\0";
+    const IO_HID_PARAM_CONNECT_TYPE: u32 = 1;
+    static CONNECTION: OnceLock<Option<u32>> = OnceLock::new();
+
+    *CONNECTION.get_or_init(|| unsafe {
+        let matching = IOServiceMatching(IO_HID_SYSTEM_CLASS.as_ptr().cast());
+        if matching.is_null() {
+            return None;
+        }
+
+        // IOServiceGetMatchingService consumes the matching dictionary.
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+
+        let mut connection = 0;
+        let result = IOServiceOpen(
+            service,
+            mach_task_self_,
+            IO_HID_PARAM_CONNECT_TYPE,
+            &mut connection,
+        );
+        let _ = IOObjectRelease(service);
+        (result == 0 && connection != 0).then_some(connection)
+    })
+}
+
+fn post_hid_key(key: u16, key_down: bool, repeat: bool, flags: u32) -> i32 {
+    const NX_KEYDOWN: u32 = 10;
+    const NX_KEYUP: u32 = 11;
+    const NX_EVENT_DATA_VERSION: u32 = 2;
+    const KERN_FAILURE: i32 = 5;
+
+    let Some(connection) = hid_event_driver() else {
+        return KERN_FAILURE;
+    };
+    let event = NXKeyEventData {
+        repeat: i16::from(repeat),
+        key_code: key,
+        ..NXKeyEventData::default()
+    };
+    unsafe {
+        IOHIDPostEvent(
+            connection,
+            if key_down { NX_KEYDOWN } else { NX_KEYUP },
+            IOGPoint::default(),
+            &event,
+            NX_EVENT_DATA_VERSION,
+            flags,
+            0,
+        )
+    }
+}
+
+async fn post_input_source_shortcut(event_source: CGEventSource, modifiers: XMods) {
+    const MAC_LEFT_CONTROL_KEYCODE: CGKeyCode = 0x3b;
+    const MAC_SPACE_KEYCODE: CGKeyCode = 0x31;
+    const SHORTCUT_HOLD: Duration = Duration::from_millis(30);
+
+    let control_was_down = modifiers.contains(XMods::ControlMask);
+    let shortcut_modifiers = modifiers | XMods::ControlMask;
+    if !control_was_down {
+        modifier_key_event(
+            event_source.clone(),
+            MAC_LEFT_CONTROL_KEYCODE,
+            1,
+            shortcut_modifiers,
+            PhysicalModifiers::LEFT_CONTROL,
+        );
+    }
+    key_event(
+        event_source.clone(),
+        MAC_SPACE_KEYCODE,
+        1,
+        shortcut_modifiers,
+    );
+    tokio::time::sleep(SHORTCUT_HOLD).await;
+    key_event(
+        event_source.clone(),
+        MAC_SPACE_KEYCODE,
+        0,
+        shortcut_modifiers,
+    );
+    if !control_was_down {
+        tokio::time::sleep(INPUT_SOURCE_KEY_UP_GAP).await;
+        modifier_key_event(
+            event_source,
+            MAC_LEFT_CONTROL_KEYCODE,
+            0,
+            modifiers,
+            PhysicalModifiers::empty(),
+        );
+    }
+    log::trace!("posted stateless Control+Space input-source shortcut");
+}
+
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
+    post_key_event(event_source, key, state, modifiers, false, false);
+}
+
+fn post_key_event(
+    event_source: CGEventSource,
+    key: u16,
+    state: u8,
+    modifiers: XMods,
+    autorepeat: bool,
+    force_quartz: bool,
+) {
+    if uses_hid_ime_path(key) && !force_quartz {
+        let flags = to_cgevent_flags(modifiers).bits() as u32;
+        let result = post_hid_key(key, state != 0, autorepeat, flags);
+        if result == 0 {
+            log::trace!("HID key event: {key} {state}");
+            return;
+        }
+        log::warn!(
+            "HID IME key injection failed for key code {key} ({result}); falling back to Quartz"
+        );
+    }
+
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
         Err(_) => {
@@ -799,21 +722,108 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
             return;
         }
     };
-    event.set_flags(to_cgevent_flags(modifiers));
-    event.post(CGEventTapLocation::HID);
+    event.set_flags(key_event_flags(key, modifiers, event.get_flags()));
+    event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, autorepeat as i64);
+    event.post(KEYBOARD_EVENT_TAP_LOCATION);
     log::trace!("key event: {key} {state}");
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
-        log::warn!("could not create CGEvent");
+fn key_event_flags(
+    key: CGKeyCode,
+    modifiers: XMods,
+    intrinsic_flags: CGEventFlags,
+) -> CGEventFlags {
+    // `set_flags` replaces the complete Quartz flag word. Replace only the
+    // modifier portion with the state received from the controller. The
+    // NumericPad and SecondaryFn bits classify the *current* key, not held
+    // modifiers. Recompute them so a letter never inherits keypad semantics.
+    // Preserve opaque source metadata used by Quartz.
+    const DEVICE_INDEPENDENT_MODIFIER_BITS: u64 = 0x001f_0000;
+    const DEVICE_DEPENDENT_MODIFIER_BITS: u64 = 0x0000_20ff;
+    const STATELESS_CAPS_LOCK_BIT: u64 = 0x0100_0000;
+    let modifier_bits = DEVICE_INDEPENDENT_MODIFIER_BITS
+        | DEVICE_DEPENDENT_MODIFIER_BITS
+        | STATELESS_CAPS_LOCK_BIT
+        | CGEventFlags::CGEventFlagNumericPad.bits()
+        | CGEventFlags::CGEventFlagSecondaryFn.bits();
+    let mut flags = CGEventFlags::from_bits_retain(
+        (intrinsic_flags.bits() & !modifier_bits) | to_cgevent_flags(modifiers).bits(),
+    );
+    if is_arrow_keycode(key) {
+        flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
+    } else if is_keypad_keycode(key) {
+        flags |= CGEventFlags::CGEventFlagNumericPad;
+    }
+    flags
+}
+
+fn is_arrow_keycode(key: CGKeyCode) -> bool {
+    // kVK_LeftArrow, kVK_RightArrow, kVK_DownArrow, kVK_UpArrow.
+    matches!(key, 0x7b..=0x7e)
+}
+
+fn modifier_key_event(
+    event_source: CGEventSource,
+    key: CGKeyCode,
+    state: u8,
+    modifiers: XMods,
+    physical: PhysicalModifiers,
+) {
+    let Ok(event) = CGEvent::new_keyboard_event(event_source, key, state != 0) else {
+        log::warn!("unable to create modifier key event");
         return;
     };
-    let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
+    event.set_flags(modifier_flags(modifiers, physical));
+    event.post(KEYBOARD_EVENT_TAP_LOCATION);
+    log::trace!("modifier key event: {key} {state}");
+}
+
+async fn wait_for_shortcut_key_up_gap(previous_release: Option<Instant>) {
+    let Some(previous_release) = previous_release else {
+        return;
+    };
+    let elapsed = previous_release.elapsed();
+    if elapsed < INPUT_SOURCE_KEY_UP_GAP {
+        tokio::time::sleep(INPUT_SOURCE_KEY_UP_GAP - elapsed).await;
+    }
+}
+
+fn modifier_flags(modifiers: XMods, physical: PhysicalModifiers) -> CGEventFlags {
+    let mut bits = to_cgevent_flags(modifiers).bits();
+    // NX device-dependent bits distinguish left/right keys on FlagsChanged.
+    for (side, bit) in [
+        (PhysicalModifiers::LEFT_CONTROL, 0x0001),
+        (PhysicalModifiers::LEFT_SHIFT, 0x0002),
+        (PhysicalModifiers::RIGHT_SHIFT, 0x0004),
+        (PhysicalModifiers::LEFT_COMMAND, 0x0008),
+        (PhysicalModifiers::RIGHT_COMMAND, 0x0010),
+        (PhysicalModifiers::LEFT_OPTION, 0x0020),
+        (PhysicalModifiers::RIGHT_OPTION, 0x0040),
+        (PhysicalModifiers::RIGHT_CONTROL, 0x2000),
+    ] {
+        if physical.contains(side) {
+            bits |= bit;
+        }
+    }
+    CGEventFlags::from_bits_retain(bits)
+}
+
+// Snapshots have no keycode. Emit actual modifier transitions instead of
+// posting a FlagsChanged event with the default keycode (A).
+fn snapshot_transitions(previous: XMods, current: XMods) -> Vec<(CGKeyCode, u8)> {
+    [
+        (XMods::ShiftMask, 0x38),
+        (XMods::ControlMask, 0x3b),
+        (XMods::Mod1Mask, 0x3a),
+        (XMods::Mod4Mask, 0x37),
+    ]
+    .into_iter()
+    .filter_map(|(mask, key)| {
+        (previous.contains(mask) != current.contains(mask))
+            .then_some((key, u8::from(current.contains(mask))))
+    })
+    .collect()
 }
 
 /// Union of every active display's rectangle, as `(origin_x,
@@ -1039,23 +1049,25 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
-                    let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
-                        Ok(k) => k.mac as CGKeyCode,
-                        Err(_) => {
-                            log::warn!("unable to map key event");
-                            return Ok(());
-                        }
+                    let Some(code) = macos_keycode(key) else {
+                        log::warn!("unable to map key event");
+                        return Ok(());
                     };
 
-                    // Quartz-synthesized Caps events bypass macOS's hardware
-                    // short-press input-source path and can instead toggle the
-                    // uppercase latch. Complete the same user-visible action
-                    // through Text Input Source Services on physical release.
+                    // Quartz Caps events do not enter macOS's hardware-only
+                    // language-switch path. Emit the user's working system
+                    // input-source shortcut without tracking either source.
                     if is_caps_lock(key) {
-                        self.handle_caps_lock(state).await;
+                        if let Some(done) = self.handle_caps_lock(state) {
+                            let _ = done.await;
+                        }
                         return Ok(());
                     }
 
+                    let is_control = is_control_key(key);
+                    if is_control && state == 0 {
+                        wait_for_shortcut_key_up_gap(self.last_space_release).await;
+                    }
                     let is_modifier = update_modifiers(
                         &self.physical_modifiers,
                         &self.modifier_state,
@@ -1063,22 +1075,30 @@ impl Emulation for MacOSEmulation {
                         state,
                     );
                     if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
-                        // Modifier presses are state transitions, not
-                        // repeatable characters. Preserve the key event that
-                        // applications expect without creating a repeat task.
-                        key_event(
+                        modifier_key_event(
                             self.event_source.clone(),
                             code,
                             state,
                             self.modifier_state.get(),
+                            self.physical_modifiers.get(),
                         );
+                        if is_control && state == 0 {
+                            self.last_control_release = Some(Instant::now());
+                        }
                         return Ok(());
                     }
                     match state {
                         // pressed
                         1 => self.spawn_repeat_task(code).await,
-                        _ => self.release_key(code).await,
+                        _ => {
+                            if is_space_key(key) {
+                                wait_for_shortcut_key_up_gap(self.last_control_release).await;
+                            }
+                            self.release_key(code).await;
+                            if is_space_key(key) {
+                                self.last_space_release = Some(Instant::now());
+                            }
+                        }
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -1087,15 +1107,24 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
+                    let previous = self.modifier_state.get();
                     set_modifiers(
                         &self.physical_modifiers,
                         &self.modifier_state,
                         depressed,
                         latched,
-                        locked,
+                        macos_locked_modifiers(locked),
                         group,
                     );
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
+                    for (key, state) in snapshot_transitions(previous, self.modifier_state.get()) {
+                        modifier_key_event(
+                            self.event_source.clone(),
+                            key,
+                            state,
+                            self.modifier_state.get(),
+                            self.physical_modifiers.get(),
+                        );
+                    }
                 }
             },
             Event::Clipboard(_) => {
@@ -1108,20 +1137,50 @@ impl Emulation for MacOSEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, _handle: EmulationHandle) {
+        self.quartz_modified_keys.clear();
+        self.physical_modifiers.set(PhysicalModifiers::empty());
+        self.modifier_state.set(XMods::empty());
+        self.last_control_release = None;
+        self.last_space_release = None;
+    }
 
     async fn destroy(&mut self, _handle: EmulationHandle) {
         self.cancel_repeat_task().await;
+        self.quartz_modified_keys.clear();
         self.release_tracked_buttons();
+        for (key, state) in snapshot_transitions(self.modifier_state.get(), XMods::empty()) {
+            modifier_key_event(
+                self.event_source.clone(),
+                key,
+                state,
+                XMods::empty(),
+                PhysicalModifiers::empty(),
+            );
+        }
         self.physical_modifiers.set(PhysicalModifiers::empty());
         self.modifier_state.set(XMods::empty());
+        self.last_control_release = None;
+        self.last_space_release = None;
     }
 
     async fn terminate(&mut self) {
         self.cancel_repeat_task().await;
+        self.quartz_modified_keys.clear();
         self.release_tracked_buttons();
+        for (key, state) in snapshot_transitions(self.modifier_state.get(), XMods::empty()) {
+            modifier_key_event(
+                self.event_source.clone(),
+                key,
+                state,
+                XMods::empty(),
+                PhysicalModifiers::empty(),
+            );
+        }
         self.physical_modifiers.set(PhysicalModifiers::empty());
         self.modifier_state.set(XMods::empty());
+        self.last_control_release = None;
+        self.last_space_release = None;
     }
 
     fn display_bounds(&mut self) -> Option<(u32, u32)> {
@@ -1263,10 +1322,31 @@ fn is_caps_lock(key: u32) -> bool {
     scancode::Linux::try_from(key).is_ok_and(|key| key == scancode::Linux::KeyCapsLock)
 }
 
-fn toggle_caps_lock(modifiers: &Cell<XMods>) {
-    let mut state = modifiers.get();
-    state.toggle(XMods::LockMask);
-    modifiers.set(state);
+fn macos_keycode(key: u32) -> Option<CGKeyCode> {
+    scancode::Linux::try_from(key).ok()?;
+    KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16))
+        .ok()
+        .map(|mapping| mapping.mac as CGKeyCode)
+}
+
+fn is_control_key(key: u32) -> bool {
+    scancode::Linux::try_from(key).is_ok_and(|key| {
+        matches!(
+            key,
+            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl
+        )
+    })
+}
+
+fn is_space_key(key: u32) -> bool {
+    scancode::Linux::try_from(key).is_ok_and(|key| key == scancode::Linux::KeySpace)
+}
+
+fn macos_locked_modifiers(locked: u32) -> u32 {
+    // Caps Lock is forwarded as its own macOS status-key event. Carrying the
+    // wire LockMask into every later CGEvent duplicates that action and can
+    // pin the receiver in either the Latin or non-Latin input source.
+    locked & !XMods::LockMask.bits()
 }
 
 fn set_modifiers(
@@ -1364,10 +1444,11 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputSourceDescriptor, InputSourceHistoryKey, PhysicalModifiers, XMods, button_event_spec,
-        caps_lock_press_completed, choose_non_ascii_input_source, commit_button_state,
-        is_caps_lock, set_modifiers, union_to_global, update_modifiers,
+        PhysicalModifiers, XMods, button_event_spec, commit_button_state, has_shortcut_modifier,
+        is_caps_lock, key_event_flags, macos_keycode, macos_locked_modifiers, set_modifiers,
+        union_to_global, update_modifiers, uses_hid_ime_path,
     };
+    use core_graphics::event::CGEventFlags;
     use input_event::{
         BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
         scancode::Linux::{
@@ -1379,83 +1460,26 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn caps_switch_prefers_the_last_non_ascii_source() {
-        let sources = [
-            InputSourceDescriptor {
-                id: "com.apple.keylayout.ABC".into(),
-                ascii_capable: true,
-            },
-            InputSourceDescriptor {
-                id: "com.apple.inputmethod.TCIM.Zhuyin".into(),
-                ascii_capable: false,
-            },
-            InputSourceDescriptor {
-                id: "com.apple.inputmethod.Korean.2SetKorean".into(),
-                ascii_capable: false,
-            },
-        ];
+    fn command_snapshot_release_has_a_command_keycode() {
         assert_eq!(
-            choose_non_ascii_input_source(
-                &sources,
-                Some("com.apple.inputmethod.Korean.2SetKorean"),
-                &[],
-            )
-            .as_deref(),
-            Some("com.apple.inputmethod.Korean.2SetKorean")
+            super::snapshot_transitions(XMods::Mod4Mask, XMods::empty()),
+            vec![(0x37, 0)]
         );
-        assert_eq!(
-            choose_non_ascii_input_source(
-                &sources,
-                Some("missing.source"),
-                &[
-                    InputSourceHistoryKey::Id("disabled.source".into()),
-                    InputSourceHistoryKey::Id("com.apple.inputmethod.Korean.2SetKorean".into()),
-                ],
-            )
-            .as_deref(),
-            Some("com.apple.inputmethod.Korean.2SetKorean")
-        );
-        assert_eq!(choose_non_ascii_input_source(&sources, None, &[]), None);
+        assert!(super::snapshot_transitions(XMods::Mod4Mask, XMods::Mod4Mask).is_empty());
     }
 
     #[test]
-    fn caps_switches_once_after_a_complete_press() {
-        let mut pressed = false;
-        assert!(!caps_lock_press_completed(&mut pressed, 0));
-        assert!(!caps_lock_press_completed(&mut pressed, 1));
-        assert!(!caps_lock_press_completed(&mut pressed, 2));
-        assert!(caps_lock_press_completed(&mut pressed, 0));
-        assert!(!caps_lock_press_completed(&mut pressed, 0));
+    fn flags_identify_the_remaining_right_command() {
+        let flags = super::modifier_flags(XMods::Mod4Mask, PhysicalModifiers::RIGHT_COMMAND);
+        assert_ne!(flags.bits() & 0x10, 0);
+        assert_eq!(flags.bits() & 0x8, 0);
+        assert!(flags.contains(CGEventFlags::CGEventFlagCommand));
     }
 
     #[test]
-    #[ignore = "temporarily changes the active macOS input source"]
-    fn caps_switch_round_trips_the_active_input_source() {
-        use super::{
-            current_non_ascii_input_source_id, input_source_descriptor,
-            switch_caps_lock_input_source, with_current_input_source,
-        };
-
-        let before = with_current_input_source(input_source_descriptor)
-            .flatten()
-            .expect("current input source");
-        let mut last_non_ascii = current_non_ascii_input_source_id();
-        let (_, first_target) =
-            switch_caps_lock_input_source(&mut last_non_ascii).expect("first input-source switch");
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let after_first = with_current_input_source(input_source_descriptor)
-            .flatten()
-            .expect("input source after first switch");
-        assert_eq!(after_first.id, first_target);
-
-        let (_, second_target) =
-            switch_caps_lock_input_source(&mut last_non_ascii).expect("second input-source switch");
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let after_second = with_current_input_source(input_source_descriptor)
-            .flatten()
-            .expect("input source after second switch");
-        assert_eq!(after_second.id, second_target);
-        assert_eq!(after_second.id, before.id);
+    fn nx_key_event_data_matches_iokit_abi() {
+        assert_eq!(std::mem::size_of::<super::NXKeyEventData>(), 48);
+        assert_eq!(std::mem::align_of::<super::NXKeyEventData>(), 4);
     }
 
     #[test]
@@ -1493,6 +1517,104 @@ mod tests {
         assert!(modifiers.get().is_empty());
 
         assert!(modifiers.get().is_empty());
+    }
+
+    #[test]
+    fn wire_caps_lock_is_not_replayed_as_a_persistent_macos_flag() {
+        let locked = XMods::LockMask.bits() | XMods::Mod2Mask.bits();
+        assert_eq!(macos_locked_modifiers(locked), XMods::Mod2Mask.bits());
+    }
+
+    #[test]
+    fn arrow_events_keep_the_flags_required_for_text_candidate_navigation() {
+        for key in 0x7b..=0x7e {
+            let flags = key_event_flags(key, XMods::ShiftMask, CGEventFlags::empty());
+            assert!(flags.contains(CGEventFlags::CGEventFlagShift));
+            assert!(flags.contains(CGEventFlags::CGEventFlagNumericPad));
+            assert!(flags.contains(CGEventFlags::CGEventFlagSecondaryFn));
+        }
+    }
+
+    #[test]
+    fn ordinary_keys_do_not_gain_arrow_classification_flags() {
+        let inherited = CGEventFlags::CGEventFlagNumericPad
+            | CGEventFlags::CGEventFlagSecondaryFn
+            | CGEventFlags::from_bits_retain(0x2000_0000);
+        let flags = key_event_flags(0x00, XMods::empty(), inherited);
+        assert!(!flags.contains(CGEventFlags::CGEventFlagNumericPad));
+        assert!(!flags.contains(CGEventFlags::CGEventFlagSecondaryFn));
+        assert_eq!(flags.bits() & 0x2000_0000, 0x2000_0000);
+    }
+
+    #[test]
+    fn enter_keys_keep_their_distinct_macos_keycodes() {
+        assert_eq!(
+            macos_keycode(Linux::KeyEnter as u32),
+            Some(super::MAC_RETURN_KEYCODE)
+        );
+        assert_eq!(
+            macos_keycode(Linux::KeyKpEnter as u32),
+            Some(super::MAC_KEYPAD_ENTER_KEYCODE)
+        );
+    }
+
+    #[test]
+    fn enter_escape_and_letters_use_the_hid_ime_path() {
+        assert!(uses_hid_ime_path(super::MAC_RETURN_KEYCODE));
+        assert!(uses_hid_ime_path(super::MAC_KEYPAD_ENTER_KEYCODE));
+        assert!(uses_hid_ime_path(super::MAC_ESCAPE_KEYCODE));
+        assert_eq!(
+            macos_keycode(Linux::KeyEsc as u32),
+            Some(super::MAC_ESCAPE_KEYCODE)
+        );
+        assert!(uses_hid_ime_path(0x00));
+        assert!(!uses_hid_ime_path(0x31));
+    }
+
+    #[test]
+    fn shortcut_modifiers_select_quartz_for_hid_keys() {
+        for modifier in [
+            XMods::ShiftMask,
+            XMods::ControlMask,
+            XMods::Mod1Mask,
+            XMods::Mod4Mask,
+            XMods::Mod5Mask,
+        ] {
+            assert!(has_shortcut_modifier(modifier));
+        }
+        assert!(!has_shortcut_modifier(XMods::empty()));
+        assert!(!has_shortcut_modifier(XMods::LockMask));
+        assert!(uses_hid_ime_path(super::MAC_RETURN_KEYCODE));
+        assert!(uses_hid_ime_path(super::MAC_KEYPAD_ENTER_KEYCODE));
+    }
+
+    #[test]
+    fn keypad_digits_and_operators_use_quartz_with_numeric_pad_flags() {
+        for linux_key in [
+            Linux::KeyKp0,
+            Linux::KeyKp5,
+            Linux::KeyKp9,
+            Linux::KeyKpDot,
+            Linux::KeyKpAsterisk,
+            Linux::KeyKpplus,
+            Linux::KeyKpMinus,
+            Linux::KeyKpslash,
+            Linux::KeyKpequal,
+        ] {
+            let key = macos_keycode(linux_key as u32).expect("keypad mapping");
+            assert!(!uses_hid_ime_path(key), "{linux_key:?}");
+            let flags = key_event_flags(key, XMods::empty(), CGEventFlags::empty());
+            assert!(
+                flags.contains(CGEventFlags::CGEventFlagNumericPad),
+                "{linux_key:?}"
+            );
+            assert!(!flags.contains(CGEventFlags::CGEventFlagSecondaryFn));
+        }
+
+        let letter = macos_keycode(Linux::KeyA as u32).expect("letter mapping");
+        assert!(uses_hid_ime_path(letter));
+        let flags = key_event_flags(letter, XMods::empty(), CGEventFlags::CGEventFlagNumericPad);
+        assert!(!flags.contains(CGEventFlags::CGEventFlagNumericPad));
     }
 
     #[test]

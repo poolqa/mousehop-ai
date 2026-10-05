@@ -123,6 +123,8 @@ impl Emulation for WindowsEmulation {
                         // repeats: delayed release delivery must not flip the
                         // Windows lock state more than once.
                         self.kill_repeat_task();
+                    } else if is_modifier_key(key) {
+                        // Modifier keys never repeat on a physical keyboard.
                     } else {
                         match state {
                             // pressed
@@ -328,6 +330,20 @@ fn scroll(axis: u8, value: i32) {
         dwExtraInfo: 0,
     };
     send_mouse_input(mi);
+}
+
+fn is_modifier_key(key: u32) -> bool {
+    matches!(
+        scancode::Linux::try_from(key),
+        Ok(scancode::Linux::KeyLeftShift
+            | scancode::Linux::KeyRightShift
+            | scancode::Linux::KeyLeftCtrl
+            | scancode::Linux::KeyRightCtrl
+            | scancode::Linux::KeyLeftAlt
+            | scancode::Linux::KeyRightalt
+            | scancode::Linux::KeyLeftMeta
+            | scancode::Linux::KeyRightmeta)
+    )
 }
 
 fn key_event(key: u32, state: u8) {

@@ -35,6 +35,7 @@ pub mod clipboard;
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
+mod modifiers;
 
 pub type EmulationHandle = u64;
 
@@ -289,6 +290,31 @@ impl InputEmulation {
                     self.emulation.consume(event, handle).await?;
                 }
                 Ok(())
+            }
+            Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed, latched, ..
+            }) if cfg!(any(target_os = "macos", windows)) => {
+                // A snapshot can arrive even when the individual key-up was lost.
+                // Reconcile the shared tracker too, so the next press is not suppressed.
+                let stale = self
+                    .pressed_keys
+                    .get(&handle)
+                    .map(|keys| modifiers::released_modifiers(keys, depressed | latched))
+                    .unwrap_or_default();
+                for key in stale {
+                    self.emulation
+                        .consume(
+                            Event::Keyboard(KeyboardEvent::Key {
+                                time: 0,
+                                key,
+                                state: 0,
+                            }),
+                            handle,
+                        )
+                        .await?;
+                    self.update_pressed_keys(handle, key, 0);
+                }
+                self.emulation.consume(event, handle).await
             }
             _ => self.emulation.consume(event, handle).await,
         }

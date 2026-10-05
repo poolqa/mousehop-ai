@@ -367,6 +367,21 @@ mousehop daemon
 ```
 </details>
 
+### Modifier key recovery
+
+On macOS and Windows, an incoming modifier snapshot releases tracked modifier
+keys whose group is no longer held, including Command / Windows, while retaining
+both physical sides when their group is still held. This also clears the shared
+key tracker so the next press is accepted. macOS emits modifier transitions with
+real keycodes and left/right flags; Windows does not synthesize modifier repeats.
+Disconnect and shutdown release tracked keys and stop keyboard repeat tasks.
+Recovery from a lost release requires a subsequent snapshot or session cleanup.
+
+Manual regression checks on a Mac/Windows pair: use left and right Command /
+Windows shortcuts, hold both sides and release one, switch screens with a modifier
+held, and disconnect during a held shortcut. Verify ordinary typing after each
+case without having to tap a modifier again.
+
 ## Systemd Service
 
 In order to start mousehop with a graphical session automatically,
