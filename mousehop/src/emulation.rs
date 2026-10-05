@@ -906,10 +906,17 @@ impl ListenTask {
                                     let proxy_tx = self.emulation_proxy.request_tx.clone();
                                     let event_tx = self.event_tx.clone();
                                     let origin = stream_offer.offer.origin_fingerprint.clone();
+                                    #[cfg(windows)]
+                                    let desktop_generation = mousehop_ipc::desktop::current().map(|link| link.generation());
                                     spawn_local(async move {
                                         match receive_stream(addr, stream_offer, TransferLimits::default()).await {
                                             Ok(staged) => match staged.into_event() {
                                                 Ok(event) => {
+                                                    #[cfg(windows)]
+                                                    if mousehop_ipc::desktop::current().is_some_and(|link| link.secure() || Some(link.generation()) != desktop_generation) {
+                                                        log::debug!("discarding clipboard transfer across a desktop transition");
+                                                        return;
+                                                    }
                                                     if proxy_tx
                                                         .send(ProxyRequest::Input(
                                                             Event::Clipboard(event.clone()),

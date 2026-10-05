@@ -56,8 +56,13 @@ impl EventThread {
         }
     }
 
-    pub(crate) fn release_capture(&self) {
-        self.signal(RequestType::Release);
+    pub(crate) async fn release_capture(&self) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.client_update(ClientUpdate::Release(tx));
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx).await,
+            Ok(Ok(()))
+        )
     }
 
     pub(crate) fn create(&self, pos: Position) {
@@ -99,7 +104,6 @@ impl Drop for EventThread {
 
 enum RequestType {
     ClientUpdate = 0,
-    Release = 1,
     Exit = 2,
 }
 
@@ -107,6 +111,7 @@ enum ClientUpdate {
     Create(Position),
     Destroy(Position),
     SetCrossingModifier(Position, Option<CrossingModifier>),
+    Release(tokio::sync::oneshot::Sender<()>),
 }
 
 /// `SetTimer` id for the low-level-hook watchdog.
@@ -142,6 +147,7 @@ thread_local! {
     /// would happily forward motion to the peer while the lock screen
     /// consumes keyboard events, leaving a half-broken state.
     static HOST_LOCKED: Cell<bool> = const { Cell::new(false) };
+    static DESKTOP_SECURE: Cell<bool> = const { Cell::new(false) };
     /// Momentary modifiers observed by the global low-level keyboard hook,
     /// including presses that happened before an edge activated capture.
     static HOST_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
@@ -197,6 +203,10 @@ fn start_routine(
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
+    // A Winlogon helper starts after the lock notification was already sent.
+    // Initialize from its assigned desktop rather than waiting for another lock.
+    DESKTOP_SECURE.set(desktop_is_secure());
+    HOST_LOCKED.set(DESKTOP_SECURE.get());
     EVENT_TX.replace(Some(event_tx));
     /* communicate thread id */
     {
@@ -300,9 +310,6 @@ fn start_routine(
             /* messages sent via PostThreadMessage */
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
-                x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
-                }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
                         let mut res = vec![];
@@ -468,6 +475,20 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    let mouse = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+    if mouse.flags & windows::Win32::UI::WindowsAndMessaging::LLMHF_INJECTED != 0
+        || mouse.dwExtraInfo == input_event::WINDOWS_INPUT_EVENT_TAG
+    {
+        // Injected movement must neither cross a barrier nor become physical
+        // motion relative to an old position when the next real event arrives.
+        if wparam.0 == WM_MOUSEMOVE as usize {
+            PREV_POS.set(Some((mouse.pt.x, mouse.pt.y)));
+        }
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     HOOK_FIRED.store(true, Ordering::Relaxed);
     let active = check_client_activation(wparam, lparam);
 
@@ -496,6 +517,17 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    if key
+        .flags
+        .contains(windows::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED)
+        || key.dwExtraInfo == input_event::WINDOWS_INPUT_EVENT_TAG
+    {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     HOOK_FIRED.store(true, Ordering::Relaxed);
     /* convert to key event */
     let Some(key_event) = to_key_event(wparam, lparam) else {
@@ -542,7 +574,8 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WTS_SESSION_UNLOCK => {
-                HOST_LOCKED.set(false);
+                // The unlock notification can precede Default activation.
+                HOST_LOCKED.set(DESKTOP_SECURE.get());
                 log::info!("host session unlocked");
             }
             _ => {}
@@ -704,6 +737,11 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
 
 fn update_clients(request: ClientUpdate) {
     match request {
+        ClientUpdate::Release(completion) => {
+            ACTIVE_CLIENT.take();
+            PREV_POS.set(None);
+            let _ = completion.send(());
+        }
         ClientUpdate::Create(pos) => {
             CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
         }
@@ -839,5 +877,30 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+fn desktop_is_secure() -> bool {
+    use windows::Win32::System::StationsAndDesktops::{
+        GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
+    };
+    unsafe {
+        let Ok(desktop) = GetThreadDesktop(GetCurrentThreadId()) else {
+            return true;
+        };
+        let mut name = [0u16; 256];
+        if GetUserObjectInformationW(
+            windows::Win32::Foundation::HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            std::mem::size_of_val(&name) as u32,
+            None,
+        )
+        .is_err()
+        {
+            return true;
+        }
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        !String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("default")
     }
 }

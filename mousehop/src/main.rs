@@ -110,7 +110,6 @@ fn main() {
     {
         let result = match std::env::args().nth(1).as_deref() {
             Some("windows-service") => Some(mousehop::windows_service::dispatch()),
-            Some("windows-session") => Some(mousehop::windows_service::session_broker()),
             _ => None,
         };
         if let Some(result) = result {
@@ -165,7 +164,11 @@ fn run() -> Result<(), MousehopError> {
             #[cfg(windows)]
             Command::WindowsWorker => {
                 mousehop_ipc::windows::require_system()?;
-                run_async(run_service(config))?;
+                run_async(mousehop::windows_service::desktop_worker(config))?;
+            }
+            #[cfg(windows)]
+            Command::WindowsSession => {
+                run_async(mousehop::windows_service::run_session(config))?;
             }
             Command::Daemon => {
                 // if daemon is specified we run the service

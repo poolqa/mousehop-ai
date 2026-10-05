@@ -47,7 +47,9 @@ async fn shutdown_signal() -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        if crate::windows_service::worker_mode() {
+        if mousehop_ipc::desktop::current().is_some() {
+            crate::windows_service::session_shutdown().await
+        } else if crate::windows_service::worker_mode() {
             crate::windows_service::worker_shutdown().await
         } else {
             signal::ctrl_c().await
@@ -136,6 +138,7 @@ pub struct Service {
     /// loop and fans the resulting events out to peers whose
     /// `clipboard_send` is true.
     clipboard_monitor: Option<ClipboardMonitor>,
+    desktop_clipboard: Option<tokio::sync::mpsc::Receiver<(u64, ClipboardEvent)>>,
     /// Recent forwards keyed on `(originator_fingerprint, hash)`.
     /// Used to break N-peer rebroadcast cycles: when this device
     /// receives a forwarded clipboard frame and would re-fan to
@@ -323,7 +326,8 @@ impl Service {
         let allow_clipboard = {
             #[cfg(windows)]
             {
-                !crate::windows_service::secure_desktop()
+                mousehop_ipc::desktop::current().is_none()
+                    && !crate::windows_service::secure_desktop()
             }
             #[cfg(not(windows))]
             {
@@ -366,6 +370,11 @@ impl Service {
             current_network,
             conn: conn_for_service,
             clipboard_monitor,
+            #[cfg(windows)]
+            desktop_clipboard: mousehop_ipc::desktop::current()
+                .map(|link| link.subscribe_clipboard()),
+            #[cfg(not(windows))]
+            desktop_clipboard: None,
             recent_forwarded: HashMap::new(),
             clipboard_suppression,
             fastest_streak: HashMap::new(),
@@ -414,6 +423,9 @@ impl Service {
                 _ = discovery_refresh_tick.tick() => self.on_discovery_refresh().await,
                 event = recv_clipboard(&mut self.clipboard_monitor) => {
                     self.handle_local_clipboard_event(event).await;
+                }
+                event = recv_desktop_clipboard(&mut self.desktop_clipboard) => {
+                    self.handle_local_clipboard_event(Some(input_capture::CaptureEvent::Input(InputEvent::Clipboard(event)))).await;
                 }
                 result = shutdown_signal() => break result?,
             }
@@ -1590,7 +1602,7 @@ impl Service {
 
     fn spawn_hook_command(&self, handle: ClientHandle) {
         #[cfg(windows)]
-        if crate::windows_service::worker_mode() {
+        if crate::windows_service::worker_mode() || mousehop_ipc::desktop::current().is_some() {
             return; // Never execute user-configured shell hooks as LocalSystem.
         }
         let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
@@ -1641,6 +1653,29 @@ async fn recv_discovery(rx: &mut Receiver<DiscoveryEvent>) -> DiscoveryEvent {
         Some(event) => event,
         None => std::future::pending().await,
     }
+}
+
+#[cfg(windows)]
+async fn recv_desktop_clipboard(
+    rx: &mut Option<tokio::sync::mpsc::Receiver<(u64, ClipboardEvent)>>,
+) -> ClipboardEvent {
+    if let Some(rx) = rx {
+        while let Some((generation, event)) = rx.recv().await {
+            if mousehop_ipc::desktop::current()
+                .is_some_and(|link| link.generation() != generation || link.secure())
+            {
+                continue;
+            }
+            return event;
+        }
+    }
+    std::future::pending().await
+}
+#[cfg(not(windows))]
+async fn recv_desktop_clipboard(
+    _rx: &mut Option<tokio::sync::mpsc::Receiver<(u64, ClipboardEvent)>>,
+) -> ClipboardEvent {
+    std::future::pending().await
 }
 
 #[cfg(test)]

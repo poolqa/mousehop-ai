@@ -141,6 +141,8 @@ pub struct InputEmulation {
     /// `None` when the platform clipboard couldn't be opened (e.g.
     /// headless CI, Wayland session without compositor support).
     clipboard: Option<ClipboardEmulation>,
+    #[cfg(windows)]
+    desktop_generation: u64,
 }
 
 impl InputEmulation {
@@ -160,14 +162,26 @@ impl InputEmulation {
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
-        let clipboard = match ClipboardEmulation::new() {
+        #[cfg(windows)]
+        let remote = mousehop_ipc::desktop::current();
+        let open_clipboard = || match ClipboardEmulation::new() {
             Ok(c) => Some(c),
             Err(e) => {
                 log::warn!("clipboard emulation unavailable: {e}");
                 None
             }
         };
+        #[cfg(windows)]
+        let clipboard = if remote.is_some() {
+            None
+        } else {
+            open_clipboard()
+        };
+        #[cfg(not(windows))]
+        let clipboard = open_clipboard();
         Ok(Self {
+            #[cfg(windows)]
+            desktop_generation: remote.as_ref().map_or(0, |link| link.generation()),
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
@@ -218,6 +232,28 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        #[cfg(windows)]
+        if let Some(remote) = mousehop_ipc::desktop::current() {
+            let generation = remote.generation();
+            if generation != self.desktop_generation {
+                // The old helper releases its own keys. Never replay held keys
+                // into a login/UAC desktop or suppress a new press as a duplicate.
+                let keys = self
+                    .pressed_keys
+                    .values_mut()
+                    .flat_map(|keys| keys.drain())
+                    .collect();
+                remote.release_keys(keys);
+                self.desktop_generation = generation;
+            }
+            if let Event::Clipboard(event) = &event {
+                remote.clipboard(event.clone());
+                return Ok(());
+            }
+            if !remote.ready() {
+                return Ok(());
+            }
+        }
         // Clipboard events route through the cross-platform
         // `ClipboardEmulation` sink, not the per-backend pointer /
         // keyboard pipeline. Per-backend `consume` impls treat
@@ -429,6 +465,25 @@ impl InputEmulation {
         });
         self.emulation.consume(event, handle).await?;
         Ok(())
+    }
+
+    /// Desktop helpers release keys retained by the network daemon across a
+    /// helper replacement, even though the new backend has no local key history.
+    #[cfg(windows)]
+    pub async fn release_previous_desktop_keys(&mut self, keys: &[u32]) {
+        for &key in keys {
+            let _ = self
+                .emulation
+                .consume(
+                    Event::Keyboard(KeyboardEvent::Key {
+                        time: 0,
+                        key,
+                        state: 0,
+                    }),
+                    0,
+                )
+                .await;
+        }
     }
 
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {

@@ -151,6 +151,11 @@ not supported. UAC and secure-attention policies are not changed by the installe
 Windows runtime acceptance checks are listed in [DOC.md](DOC.md#windows-service-installation-and-validation);
 cross-compilation alone does not verify secure-desktop input on a target machine.
 
+Desktop changes (login, lock, unlock and UAC) replace only the service's input
+helper; the console-session daemon retains the peer connections. Input may pause
+briefly while the helper changes, without a disconnect/reconnect or automatic
+cursor return. A console-session change or service restart still reconnects.
+
 **Portable ZIP.** The following instructions apply to the portable build:
 
 - Download `mousehop-windows-x86_64.zip` from the releases page and extract it somewhere permanent — the GTK DLLs next to `mousehop.exe` are required, so keep the folder intact

@@ -56,6 +56,7 @@ core-graphics = { version = "0.25.0", features = ["highsierra"] }
 keycode = "1.0.0"
 
 [target.'cfg(windows)'.dependencies]
+mousehop-ipc = { workspace = true }
 windows = { version = "0.61.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

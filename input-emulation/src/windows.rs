@@ -22,7 +22,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_ACTION,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursorPos, SystemParametersInfoW, XBUTTON1, XBUTTON2,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, XBUTTON1, XBUTTON2,
 };
 
 use super::{Emulation, EmulationHandle};
@@ -85,6 +85,7 @@ pub(crate) struct WindowsEmulation {
     /// could mix two arrangements while displays are being
     /// rearranged.
     virtual_screen_origin: Cell<Option<(i32, i32)>>,
+    remote: Option<std::sync::Arc<mousehop_ipc::desktop::Link>>,
 }
 
 impl WindowsEmulation {
@@ -92,13 +93,24 @@ impl WindowsEmulation {
         Ok(Self {
             repeat_task: None,
             virtual_screen_origin: Cell::new(None),
+            remote: mousehop_ipc::desktop::current(),
         })
     }
 }
 
 #[async_trait]
 impl Emulation for WindowsEmulation {
-    async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        if let Some(remote) = &self.remote {
+            if let Some(input) = mousehop_ipc::desktop::Input::from_event(&event) {
+                remote.send(mousehop_ipc::desktop::Request::Input { handle, input });
+            }
+            return Ok(());
+        }
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
@@ -148,7 +160,10 @@ impl Emulation for WindowsEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        if let Some(remote) = &self.remote {
+            remote.send(mousehop_ipc::desktop::Request::Destroy(handle));
+        }
         self.kill_repeat_task();
     }
 
@@ -157,6 +172,9 @@ impl Emulation for WindowsEmulation {
     }
 
     fn display_bounds(&mut self) -> Option<(u32, u32)> {
+        if let Some(remote) = &self.remote {
+            return remote.bounds();
+        }
         // Virtual-screen metrics cover the union of every monitor
         // attached to the system, matching the host-side capture
         // model that uses the union of all displays. Also the sole
@@ -181,6 +199,12 @@ impl Emulation for WindowsEmulation {
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
+        if let Some(remote) = &self.remote {
+            let _ = remote
+                .complete(|id| mousehop_ipc::desktop::Request::Warp { id, x, y })
+                .await;
+            return Ok(());
+        }
         // Cached at the last display_bounds() poll; the live query
         // is only a fallback for a warp that somehow arrives before
         // the proxy's creation-time bounds read.
@@ -189,8 +213,18 @@ impl Emulation for WindowsEmulation {
             .get()
             .unwrap_or_else(virtual_screen_origin);
         let (screen_x, screen_y) = union_to_screen(origin, x, y);
-        unsafe {
-            let _ = SetCursorPos(screen_x, screen_y);
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if width > 0 && height > 0 {
+            send_mouse_input(MOUSEINPUT {
+                dx: absolute_coordinate(screen_x, origin.0, width),
+                dy: absolute_coordinate(screen_y, origin.1, height),
+                dwFlags: MOUSEEVENTF_MOVE
+                    | windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_ABSOLUTE
+                    | windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_VIRTUALDESK,
+                dwExtraInfo: input_event::WINDOWS_INPUT_EVENT_TAG,
+                ..Default::default()
+            });
         }
         Ok(())
     }
@@ -294,7 +328,7 @@ fn rel_mouse(dx: i32, dy: i32) {
         mouseData: 0,
         dwFlags: MOUSEEVENTF_MOVE,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: input_event::WINDOWS_INPUT_EVENT_TAG,
     };
     send_mouse_input(mi);
 }
@@ -330,7 +364,7 @@ fn mouse_button(button: u32, state: u32) {
         mouseData: mouse_data,
         dwFlags: dw_flags,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: input_event::WINDOWS_INPUT_EVENT_TAG,
     };
     send_mouse_input(mi);
 }
@@ -347,7 +381,7 @@ fn scroll(axis: u8, value: i32) {
         mouseData: -value as u32,
         dwFlags: event_type,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: input_event::WINDOWS_INPUT_EVENT_TAG,
     };
     send_mouse_input(mi);
 }
@@ -385,7 +419,7 @@ fn key_event(key: u32, state: u8) -> bool {
         wScan: scancode,
         dwFlags: flags,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: input_event::WINDOWS_INPUT_EVENT_TAG,
     };
     send_keyboard_input(ki)
 }
@@ -410,10 +444,29 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     Some(windows_scancode as u16)
 }
 
+// Windows maps the 16-bit absolute coordinate to pixel cells, not endpoints.
+fn absolute_coordinate(value: i32, origin: i32, extent: i32) -> i32 {
+    let pixel = (i64::from(value) - i64::from(origin)).clamp(0, i64::from(extent) - 1);
+    ((pixel * 65536 + 32768) / i64::from(extent)).clamp(0, 65535) as i32
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{INPUT_BLOCKED, submit_input_once, union_to_screen};
+    use super::{INPUT_BLOCKED, absolute_coordinate, submit_input_once, union_to_screen};
     use std::cell::Cell;
+
+    #[test]
+    fn absolute_warp_targets_pixel_centers_including_negative_origin() {
+        for extent in [1080, 1920, 2560, 3840] {
+            for pixel in 0..extent {
+                let normalized = absolute_coordinate(pixel - 1920, -1920, extent);
+                assert_eq!(
+                    i64::from(normalized) * i64::from(extent) / 65536,
+                    i64::from(pixel)
+                );
+            }
+        }
+    }
 
     #[test]
     fn rejected_input_returns_without_retry_and_later_input_recovers() {

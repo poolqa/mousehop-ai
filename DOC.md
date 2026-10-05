@@ -209,25 +209,41 @@ without prompting or terminating portable processes. Uninstall stops only instal
 processes and preserves machine configuration and pairing data.
 
 SCM starts `mousehop.exe windows-service` as LocalSystem. The supervisor polls
-`WTSGetActiveConsoleSessionId` and launches a SYSTEM session broker with a
-primary token assigned to that session. The broker inspects `OpenInputDesktop`
-and launches `windows-worker` using `STARTUPINFO.lpDesktop` set to
-`winsta0\default` or `winsta0\Winlogon`. Each worker creates its hooks, event
-threads, emulation and clipboard objects on that desktop. An inaccessible or
-unsupported desktop causes the old worker to stop; it is not retained on a stale
-desktop. A new desktop needs a new worker because Windows forbids changing the
-desktop of a thread that already owns windows/hooks. Disconnect/reconnect during
-this replacement is expected, including re-entering the remote screen if needed.
+`WTSGetActiveConsoleSessionId` and launches a SYSTEM `windows-session` process
+with a primary token assigned to that session. That process owns frontend IPC,
+DTLS listeners, outbound connections, authenticated peer state and discovery for
+the entire console session. Its desktop supervisor inspects `OpenInputDesktop`
+and launches an input-only `windows-worker` on `winsta0\default` or
+`winsta0\Winlogon`. Only the input helper is replaced on desktop changes:
+lock/unlock and UAC transitions retain the existing DTLS sessions and input
+ownership. An inaccessible desktop causes an input gap, not a network restart.
+A console-session change or network-process failure still requires reconnecting.
+
+The per-session `Mousehop.Desktop.v1` named pipe admits SYSTEM only, rejects
+remote clients, and verifies both endpoint identities. Each helper connection has
+a generation: stale capture, clipboard and completion messages are discarded.
+Capture-edge configuration is replayed to a new helper; input events are never
+queued across a desktop transition. Pending key releases precede new input.
+Clipboard monitoring and publication run only in a Default-desktop helper;
+secure desktops and replacement gaps reject clipboard traffic. Downloaded file
+leases remain owned by the persistent network process. User-configured shell
+hooks remain disabled in service mode.
+
+Winlogon capture initializes as locked, rather than waiting for a lock notification
+that preceded helper startup. Mouse and keyboard hooks ignore injected events;
+Mousehop tags its own SendInput events. Absolute entry warps use tagged virtual-
+desktop coordinates targeting pixel centers, including negative monitor origins.
+The hook confirms capture release before a handover warp and resets its motion
+baseline, preventing an injected landing from triggering a reverse crossing.
 
 Windows input injection attempts each event once. A rejected `SendInput` event
 is skipped rather than retried in a blocking loop, so desktop transitions cannot
-starve DTLS heartbeats or the worker stop request. The first rejection and the
-next successful injection are logged; a rejected key also stops synthesized
-repeat. This does not preserve DTLS sessions across worker replacement.
+starve DTLS heartbeats or the helper stop request. The first rejection and next
+successful injection are logged; a rejected key also stops synthesized repeat.
 
 Service stop/shutdown and desktop replacement use restricted named stop events
-and the normal daemon teardown (`capture.terminate`, `emulation.terminate`, DNS
-and latency teardown). The broker allows four seconds for worker cleanup; the
+and desktop-helper teardown (`capture.terminate` and `emulation.terminate`).
+Network, DNS and latency teardown occurs only when the session daemon ends. The broker allows four seconds for worker cleanup; the
 supervisor allows ten seconds for broker cleanup. A kill-on-close job bounds each
 child process tree, including recovery after a broker/supervisor crash. Forced
 termination cannot guarantee key releases, so held-key scenarios require the
@@ -237,7 +253,10 @@ check the log for successful worker startup if input does not work.
 
 When testing lock/unlock transitions, keep a key held while switching desktops
 and verify it is released, the old worker exits without forced termination, and
-the new worker accepts a fresh DTLS connection. Repeat with the pointer moving
+the existing DTLS connection stays established while a new helper attaches.
+There should be no `dtls client disconnected` or new handover solely because the
+desktop changed, and no automatic return crossing from a tagged warp.
+Repeat with the pointer moving
 and with no input. A `SendInput rejected an event` message should not prevent
 heartbeats or shutdown; check for `SendInput recovered` if that worker remains
 on the active desktop. Perform these checks on Windows; cross-compilation alone

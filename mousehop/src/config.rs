@@ -192,6 +192,10 @@ pub enum Command {
     #[cfg(windows)]
     #[command(hide = true)]
     WindowsWorker,
+    /// Persistent SYSTEM network daemon in the active console session.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsSession,
     /// Add (or, with --remove, delete) a host-firewall rule allowing
     /// mousehop's UDP port inbound — for the detected firewall
     /// (ufw/firewalld/nftables/iptables on Linux, Windows Firewall).

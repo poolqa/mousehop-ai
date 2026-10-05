@@ -1012,5 +1012,6 @@ mod tests {
     }
 }
 
+pub mod desktop;
 #[cfg(windows)]
 pub mod windows;

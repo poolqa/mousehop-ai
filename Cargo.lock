@@ -2365,6 +2365,7 @@ dependencies = [
  "keycode",
  "log",
  "mousehop-input-event",
+ "mousehop-ipc",
  "once_cell",
  "reis",
  "thiserror 2.0.18",

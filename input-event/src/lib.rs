@@ -26,6 +26,9 @@ pub const BTN_FORWARD: u32 = 0x114;
 /// forwards them to a peer. The hexadecimal bytes spell `MOUSEHOP`.
 pub const MACOS_KEEP_AWAKE_EVENT_TAG: i64 = 0x4d4f_5553_4548_4f50;
 
+/// Identifies Mousehop's own Windows SendInput events in low-level hooks.
+pub const WINDOWS_INPUT_EVENT_TAG: usize = 0x4d48_4f50;
+
 /// Modifier family that may gate an outgoing edge crossing. Either physical
 /// side satisfies the requirement; platform UIs label these as Control,
 /// Alt/Option, Shift, and Super/Command/Windows.
@@ -39,7 +42,7 @@ pub enum CrossingModifier {
     Super,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum PointerEvent {
     /// relative motion event
     Motion { time: u32, dx: f64, dy: f64 },
@@ -62,7 +65,7 @@ pub enum PointerEvent {
     AxisDiscrete120 { axis: u8, value: i32 },
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum KeyboardEvent {
     /// a key press / release event
     Key { time: u32, key: u32, state: u8 },

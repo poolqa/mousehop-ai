@@ -16,23 +16,45 @@ mod event_thread;
 
 pub struct WindowsInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
-    event_thread: EventThread,
+    event_thread: Option<EventThread>,
+    remote: Option<std::sync::Arc<mousehop_ipc::desktop::Link>>,
+    remote_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[async_trait]
 impl Capture for WindowsInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.event_thread.create(pos);
+        if let Some(remote) = &self.remote {
+            remote.capture_create(edge(pos));
+        } else if let Some(thread) = &self.event_thread {
+            thread.create(pos);
+        }
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.event_thread.destroy(pos);
+        if let Some(remote) = &self.remote {
+            remote.capture_destroy(edge(pos));
+        } else if let Some(thread) = &self.event_thread {
+            thread.destroy(pos);
+        }
         Ok(())
     }
 
     async fn release(&mut self, _warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
-        self.event_thread.release_capture();
+        if let Some(remote) = &self.remote {
+            let _ = remote
+                .complete(mousehop_ipc::desktop::Request::Release)
+                .await;
+        } else if let Some(thread) = &self.event_thread {
+            if !thread.release_capture().await {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Windows hook did not confirm capture release",
+                )
+                .into());
+            }
+        }
         Ok(())
     }
 
@@ -41,7 +63,11 @@ impl Capture for WindowsInputCapture {
         pos: Position,
         modifier: Option<CrossingModifier>,
     ) -> Result<(), CaptureError> {
-        self.event_thread.set_crossing_modifier(pos, modifier);
+        if let Some(remote) = &self.remote {
+            remote.modifier(edge(pos), modifier);
+        } else if let Some(thread) = &self.event_thread {
+            thread.set_crossing_modifier(pos, modifier);
+        }
         Ok(())
     }
 
@@ -59,10 +85,49 @@ impl WindowsInputCapture {
         // any consumer stall; 1024 rides out brief stalls so the
         // hooks' try_send path rarely has to drop an event.
         let (event_tx, event_rx) = channel(1024);
-        let event_thread = EventThread::new(event_tx);
-        Self {
-            event_thread,
-            event_rx,
+        if let Some(remote) = mousehop_ipc::desktop::current() {
+            let mut rx = remote.subscribe_capture();
+            let generation_link = remote.clone();
+            let task = tokio::task::spawn_local(async move {
+                while let Some((generation, edge, event)) = rx.recv().await {
+                    if generation_link.generation() != generation {
+                        continue;
+                    }
+                    use mousehop_ipc::desktop::Capture as C;
+                    let event = match event {
+                        C::Begin => CaptureEvent::Begin {
+                            cursor: None,
+                            normalized_cursor: None,
+                        },
+                        C::Input(input) => CaptureEvent::Input(input.into_event()),
+                        C::AutoRelease => CaptureEvent::AutoRelease,
+                        C::Locked(locked) => CaptureEvent::HostInputState(if locked {
+                            super::HostInputState::Locked
+                        } else {
+                            super::HostInputState::Unlocked
+                        }),
+                    };
+                    let Some(pos) = position(edge) else {
+                        continue;
+                    };
+                    if event_tx.send((pos, event)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                event_thread: None,
+                event_rx,
+                remote: Some(remote),
+                remote_task: Some(task),
+            }
+        } else {
+            Self {
+                event_thread: Some(EventThread::new(event_tx)),
+                event_rx,
+                remote: None,
+                remote_task: None,
+            }
         }
     }
 }
@@ -73,6 +138,31 @@ impl Stream for WindowsInputCapture {
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
             Some(e) => Poll::Ready(Some(Ok(e))),
+        }
+    }
+}
+
+fn edge(pos: Position) -> u8 {
+    match pos {
+        Position::Left => 0,
+        Position::Right => 1,
+        Position::Top => 2,
+        Position::Bottom => 3,
+    }
+}
+fn position(edge: u8) -> Option<Position> {
+    match edge {
+        0 => Some(Position::Left),
+        1 => Some(Position::Right),
+        2 => Some(Position::Top),
+        3 => Some(Position::Bottom),
+        _ => None,
+    }
+}
+impl Drop for WindowsInputCapture {
+    fn drop(&mut self) {
+        if let Some(task) = self.remote_task.take() {
+            task.abort();
         }
     }
 }

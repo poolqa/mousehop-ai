@@ -1,6 +1,6 @@
-//! SCM supervisor -> LocalSystem console-session broker -> desktop-bound worker.
-//! Workers are replaced on desktop transitions so no hooks/windows survive on the
-//! wrong desktop. No user token or user-writable executable is ever elevated.
+//! SCM supervisor -> persistent SYSTEM session network daemon -> input helper.
+//! Desktop transitions replace only the helper; authenticated network sessions
+//! survive. No user token or user-writable executable is ever elevated.
 use mousehop_ipc::windows::{Handle, SecurityDescriptor, require_system, wide};
 use std::{
     ffi::c_void,
@@ -446,7 +446,7 @@ fn input_desktop() -> io::Result<String> {
     }
 }
 
-pub fn session_broker() -> io::Result<()> {
+fn desktop_supervisor(shutdown: std::sync::Arc<AtomicBool>) -> io::Result<()> {
     require_system()?;
     let session = session_id()?;
     if session == 0 {
@@ -464,7 +464,7 @@ pub fn session_broker() -> io::Result<()> {
         state.join("identity.pem").display()
     );
     let mut running: Option<(String, Child)> = None;
-    while !signalled(&stop) {
+    while !signalled(&stop) && !shutdown.load(Ordering::SeqCst) {
         let desktop = input_desktop().ok();
         // Fail closed while Windows has no accessible input desktop.
         if running
@@ -472,6 +472,9 @@ pub fn session_broker() -> io::Result<()> {
             .is_some_and(|(name, child)| Some(name) != desktop.as_ref() || child.stopped())
         {
             if let Some((_, child)) = running.take() {
+                if let Some(link) = mousehop_ipc::desktop::current() {
+                    link.suspend();
+                }
                 if child.stopped() {
                     let mut code = 0;
                     unsafe {
@@ -493,7 +496,9 @@ pub fn session_broker() -> io::Result<()> {
                 }
                 match spawn(&token, &desktop, &arguments) {
                     Ok(child) => {
-                        log::info!("Started input worker on {desktop}");
+                        log::info!(
+                            "Started desktop input helper on {desktop}; network daemon retained"
+                        );
                         running = Some((desktop, child));
                     }
                     Err(e) => {
@@ -574,6 +579,9 @@ pub fn elevate_settings() -> io::Result<bool> {
 /// Each worker starts on one desktop and never switches in place. Clipboard
 /// content must not cross into or out of the login/UAC desktop.
 pub fn secure_desktop() -> bool {
+    if let Some(link) = mousehop_ipc::desktop::current() {
+        return link.secure();
+    }
     use std::sync::OnceLock;
     use windows::Win32::System::{
         StationsAndDesktops::GetThreadDesktop, Threading::GetCurrentThreadId,
@@ -601,4 +609,206 @@ pub fn secure_desktop() -> bool {
         let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
         !String::from_utf16_lossy(&buffer[..len]).eq_ignore_ascii_case("default")
     })
+}
+
+/// Owns the network for the entire console session, independently of desktops.
+pub async fn run_session(config: crate::config::Config) -> io::Result<()> {
+    require_system()?;
+    let session = session_id()?;
+    let link = mousehop_ipc::desktop::initialize();
+    let mut pipe_task =
+        tokio::task::spawn_local(mousehop_ipc::desktop::serve(session, link.clone()));
+    let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = shutdown.clone();
+    let manager = std::thread::spawn(move || desktop_supervisor(flag));
+    // Geometry must be available before the first inbound handover.
+    let wait_ready = async {
+        while !link.ready() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(10), wait_ready).await;
+    log::info!("Starting persistent console-session network daemon");
+    let result = async {
+        let mut service = crate::service::Service::new(config)
+            .await
+            .map_err(io::Error::other)?;
+        tokio::select! {
+            result = service.run() => result.map_err(io::Error::other),
+            result = &mut pipe_task => Err(io::Error::other(format!("desktop pipe server stopped: {result:?}"))),
+        }
+    }
+    .await;
+    shutdown.store(true, Ordering::SeqCst);
+    let manager_result = tokio::task::spawn_blocking(move || manager.join())
+        .await
+        .map_err(io::Error::other)?
+        .map_err(|_| io::Error::other("desktop supervisor panicked"))?;
+    pipe_task.abort();
+    result.and(manager_result)
+}
+
+pub async fn session_shutdown() -> io::Result<()> {
+    let stop = open_event(&event_name("SessionStop", session_id()?))?;
+    while !signalled(&stop) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// Desktop-bound OS input only. No DTLS listener, peer dialer or frontend IPC.
+pub async fn desktop_worker(mut config: crate::config::Config) -> io::Result<()> {
+    use futures::StreamExt;
+    use input_capture::{CaptureEvent, HostInputState, InputCapture, clipboard::ClipboardMonitor};
+    use input_emulation::InputEmulation;
+    use input_event::Event;
+    use mousehop_ipc::desktop::{self, Capture, Input, Request, Response};
+    use tokio::{net::windows::named_pipe::ClientOptions, sync::mpsc};
+    require_system()?;
+    let session = session_id()?;
+    let mut pipe = loop {
+        match ClientOptions::new().open(desktop::pipe_name(session)) {
+            Ok(pipe) => break pipe,
+            Err(error) if matches!(error.raw_os_error(), Some(2 | 231)) => {
+                tokio::time::sleep(TICK).await
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    mousehop_ipc::windows::verify_server(&pipe)?;
+    let secure = secure_desktop();
+    let mut capture = InputCapture::new(Some(input_capture::Backend::Windows))
+        .await
+        .map_err(io::Error::other)?;
+    let mut emulation = InputEmulation::new(Some(input_emulation::Backend::Windows))
+        .await
+        .map_err(io::Error::other)?;
+    let suppression: input_capture::clipboard::SuppressionList = Default::default();
+    let update_suppression = |config: &crate::config::Config| {
+        let host = mousehop_ipc::HostKind::current();
+        *suppression.lock().unwrap() = config
+            .clipboard_suppression()
+            .host()
+            .iter()
+            .map(|s| host.make_ident(s.clone()))
+            .collect();
+    };
+    update_suppression(&config);
+    let mut monitor = if secure {
+        None
+    } else {
+        ClipboardMonitor::with_suppression(suppression.clone()).ok()
+    };
+    desktop::write_frame(
+        &mut pipe,
+        &Response::Ready {
+            secure,
+            bounds: emulation.display_bounds(),
+        },
+    )
+    .await?;
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+    let (tx, mut outgoing) = mpsc::channel(1024);
+    let (incoming_tx, mut incoming) = mpsc::channel(1024);
+    let read_task = tokio::task::spawn_local(async move {
+        loop {
+            let request = desktop::read_frame::<_, Request>(&mut reader).await?;
+            if incoming_tx.send(request).await.is_err() {
+                return Ok::<(), io::Error>(());
+            }
+        }
+    });
+    let write_task = tokio::task::spawn_local(async move {
+        while let Some(response) = outgoing.recv().await {
+            desktop::write_frame(&mut writer, &response).await?;
+        }
+        Ok::<(), io::Error>(())
+    });
+    let mut geometry = tokio::time::interval(Duration::from_secs(2));
+    let result = async {
+        loop {
+            tokio::select! {
+                request = incoming.recv() => {
+                    let Some(request) = request else { break; };
+                    match request {
+                        Request::CaptureCreate(edge) => if let Some(pos) = helper_position(edge) { capture.create(u64::from(edge),pos).await.map_err(io::Error::other)?; },
+                        Request::CaptureDestroy(edge) => { capture.destroy(u64::from(edge)).await.map_err(io::Error::other)?; },
+                        Request::CrossingModifier(edge,modifier) => if let Some(pos) = helper_position(edge) { capture.set_crossing_modifier(pos,modifier).await.map_err(io::Error::other)?; },
+                        Request::Release(id) => {
+                            let ok = capture.release_no_host_warp().await.is_ok();
+                            tx.send(Response::Complete {id,ok}).await.map_err(io::Error::other)?;
+                        },
+                        Request::Input {handle,input} => {
+                            emulation.create(handle).await;
+                            emulation.consume(input.into_event(),handle).await.map_err(io::Error::other)?;
+                        },
+                        Request::Destroy(handle) => emulation.destroy(handle).await,
+                        Request::ReleaseKeys(keys) => emulation.release_previous_desktop_keys(&keys).await,
+                        Request::Warp {id,x,y} => {
+                            let ok = emulation.warp_cursor(x,y).await.is_ok();
+                            tx.send(Response::Complete {id,ok}).await.map_err(io::Error::other)?;
+                        },
+                        Request::Clipboard(clipboard) => if !secure {
+                            let event = clipboard.into_event();
+                            if let Some(monitor) = &monitor { monitor.update_last_event(&event); }
+                            emulation.consume(Event::Clipboard(event),0).await.map_err(io::Error::other)?;
+                        },
+                    }
+                },
+                event = capture.next() => {
+                    let Some(event) = event else { return Err(io::Error::other("desktop capture ended")); };
+                    let (handle,event) = event.map_err(io::Error::other)?;
+                    let event = match event {
+                        CaptureEvent::Begin {..} => Capture::Begin,
+                        CaptureEvent::Input(event) => { let Some(input) = Input::from_event(&event) else { continue; }; Capture::Input(input) },
+                        CaptureEvent::AutoRelease => Capture::AutoRelease,
+                        CaptureEvent::HostInputState(state) => Capture::Locked(state == HostInputState::Locked),
+                    };
+                    tx.send(Response::Capture {edge:handle as u8,event}).await.map_err(io::Error::other)?;
+                },
+                event = helper_clipboard(&mut monitor) => {
+                    tx.send(Response::Clipboard(desktop::Clipboard::from_event(&event))).await.map_err(io::Error::other)?;
+                },
+                _ = geometry.tick() => { tx.send(Response::Geometry(emulation.display_bounds())).await.map_err(io::Error::other)?; },
+                _ = config.changed() => {
+                    update_suppression(&config);
+                },
+                _ = worker_shutdown() => break,
+            }
+        }
+        Ok::<(),io::Error>(())
+    }.await;
+    // Disconnect both pipe directions before OS teardown. A stuck hook can only
+    // delay this disposable helper, never the network daemon's heartbeat loop.
+    read_task.abort();
+    write_task.abort();
+    emulation.terminate().await;
+    let _ = capture.terminate().await;
+    log::info!("Desktop input helper exited normally (secure={secure})");
+    result
+}
+
+fn helper_position(edge: u8) -> Option<input_capture::Position> {
+    use input_capture::Position;
+    match edge {
+        0 => Some(Position::Left),
+        1 => Some(Position::Right),
+        2 => Some(Position::Top),
+        3 => Some(Position::Bottom),
+        _ => None,
+    }
+}
+async fn helper_clipboard(
+    monitor: &mut Option<input_capture::clipboard::ClipboardMonitor>,
+) -> input_event::ClipboardEvent {
+    if let Some(monitor) = monitor {
+        loop {
+            if let Some(input_capture::CaptureEvent::Input(input_event::Event::Clipboard(event))) =
+                monitor.recv().await
+            {
+                return event;
+            }
+        }
+    }
+    std::future::pending().await
 }
