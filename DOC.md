@@ -178,3 +178,162 @@ This ensures that
 - a) Events can never result in a feedback loop.
 - b) As soon as a virtual input enters another client, mousehop will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
+
+
+## Windows service installation and validation
+
+Build on macOS with `scripts/package-windows-installer.sh`. Prerequisites are the
+existing `package-windows.sh` cross-build tools and NSIS (`brew install nsis`).
+`--package-zip` skips compilation and wraps a current, service-capable ZIP;
+`--runtime-zip` selects runtime DLLs during compilation; `--output` chooses the
+Setup EXE path. The normal portable ZIP is still produced. NSIS sources are in
+`scripts/windows/`; `mousehop-installer/` contains the native x64 lifecycle helper.
+The helper is rebuilt from source even when using `--package-zip`, with a static
+CRT so it can run before the GTK/runtime DLLs are installed.
+The generated installer is unsigned unless separately signed by the distributor.
+
+NSIS extracts the standalone `mousehop-installer.exe` and runs Prepare, Install
+and Uninstall. These phases use Windows SCM, file-security, process, IP Helper and
+Firewall COM APIs directly. No PowerShell, WMI/CIM, `sc.exe` or `netsh` is invoked.
+The helper outputs phase, paths, PIDs and Windows errors to installation details.
+
+Prepare stops the verified installed service and remaining processes whose full
+executable path matches the installed `Program Files\Mousehop\mousehop.exe`.
+This includes installed Settings windows; save pending changes before upgrading.
+A same-named portable process elsewhere is not an installation blocker. If an
+actual TCP/UDP listener occupies the configured machine port (4252 by default),
+Prepare identifies its PID and path. For a portable Mousehop listener it offers
+a native confirmation to stop that specific process. Other applications are
+left running and reported as port conflicts. Silent installation reports conflicts
+without prompting or terminating portable processes. Uninstall stops only installed
+processes and preserves machine configuration and pairing data.
+
+SCM starts `mousehop.exe windows-service` as LocalSystem. The supervisor polls
+`WTSGetActiveConsoleSessionId` and launches a SYSTEM session broker with a
+primary token assigned to that session. The broker inspects `OpenInputDesktop`
+and launches `windows-worker` using `STARTUPINFO.lpDesktop` set to
+`winsta0\default` or `winsta0\Winlogon`. Each worker creates its hooks, event
+threads, emulation and clipboard objects on that desktop. An inaccessible or
+unsupported desktop causes the old worker to stop; it is not retained on a stale
+desktop. A new desktop needs a new worker because Windows forbids changing the
+desktop of a thread that already owns windows/hooks. Disconnect/reconnect during
+this replacement is expected, including re-entering the remote screen if needed.
+
+Windows input injection attempts each event once. A rejected `SendInput` event
+is skipped rather than retried in a blocking loop, so desktop transitions cannot
+starve DTLS heartbeats or the worker stop request. The first rejection and the
+next successful injection are logged; a rejected key also stops synthesized
+repeat. This does not preserve DTLS sessions across worker replacement.
+
+Service stop/shutdown and desktop replacement use restricted named stop events
+and the normal daemon teardown (`capture.terminate`, `emulation.terminate`, DNS
+and latency teardown). The broker allows four seconds for worker cleanup; the
+supervisor allows ten seconds for broker cleanup. A kill-on-close job bounds each
+child process tree, including recovery after a broker/supervisor crash. Forced
+termination cannot guarantee key releases, so held-key scenarios require the
+manual checks below. Session changes and worker failures are logged to the
+service log readable by standard users. `Running` in SCM indicates the supervisor is up;
+check the log for successful worker startup if input does not work.
+
+When testing lock/unlock transitions, keep a key held while switching desktops
+and verify it is released, the old worker exits without forced termination, and
+the new worker accepts a fresh DTLS connection. Repeat with the pointer moving
+and with no input. A `SendInput rejected an event` message should not prevent
+heartbeats or shutdown; check for `SendInput recovered` if that worker remains
+on the active desktop. Perform these checks on Windows; cross-compilation alone
+does not exercise Winlogon input or key cleanup.
+
+Settings explicitly starts a stopped SCM service and waits up to 30 seconds for
+its running status, then up to 30 seconds for the worker IPC endpoint. Failure is
+shown in a native dialog. Both Settings and workers default to the machine
+`config.toml` and `identity.pem`; portable profiles are not imported automatically.
+The Windows GUI uses named mutexes/events scoped to the user/session and installed
+or portable mode, avoiding TCP-port conflicts and stale connections after killing
+the GUI. The blocking frontend reader and writer use independent OVERLAPPED
+operations; a pending read must not serialize outgoing configuration requests.
+GTK rejects requests with a toast while reconnecting, and allows 60 seconds for
+Windows worker recovery. Worker exit codes and desktop transitions are logged;
+all installed roles install a panic hook before service dispatch and write
+`%ProgramData%\Mousehop\panic.log`. Standard users can open the shared directory
+and read both logs/configuration in Explorer, but cannot modify shared state.
+The installer protects an existing `identity.pem` with an explicit protected
+SYSTEM/Administrators DACL before adding inherited Users read/execute rights to
+the directory. A new identity is created with that private DACL before writing
+key bytes, so it never inherits public read access. Service binaries remain
+administrator-writable only, and Settings/IPC still requires administrator consent.
+
+Installed binaries carry a `service-mode` marker in the protected installation
+directory. The GUI elevates with normal UAC consent and connects to the service
+without spawning or owning a daemon. CLI commands against the installed binary
+must be run from an elevated terminal. Windows local IPC now uses named pipes
+instead of `127.0.0.1:5252`: the service endpoint allows only SYSTEM and elevated
+Administrators, while portable endpoints are isolated by user SID. Remote pipe
+clients are rejected. Clients prohibit token impersonation and verify the server
+account before sending requests. Old Windows frontend binaries using the TCP
+endpoint cannot control this version; update frontend and daemon together. The
+network protocol serialization is unchanged by this service integration.
+
+The installer fixes the binary location under Program Files, quotes the SCM
+image path, creates protected ProgramData state, rejects reparse points and
+untrusted ownership/write ACLs in existing installation/state trees, and refuses
+to replace an unrelated service named Mousehop. Machine credentials and settings
+are deliberately separate from user profiles. Settings/credentials remain after
+uninstall to preserve pairing; an administrator can explicitly delete them to
+reset trust. Installation creates Domain and Private/LocalSubnet firewall rules
+scoped to the executable. The Network access page offers an explicit Public
+network opt-in (still LocalSubnet only), off by default and remembered across
+upgrades in `HKLM\Software\Mousehop\Installer`. The native Install helper accepts
+`--allow-public` only for that phase; Prepare and Uninstall reject it. Setup
+reports active profiles, profiles covered by its rules, inbound-block-all policy
+and local-rule policy restrictions. It never changes network categories or global
+firewall policy. An outbound connection succeeding does not prove inbound rules
+cover the receiving interface; authorizing a fingerprint cannot bypass a firewall
+drop. The service logs manually added fingerprints and rejected DTLS fingerprints
+to distinguish blocked packets from credential mismatches. Shell enter-hooks
+never execute in service workers. Clipboard send/receive, including file transfer,
+is disabled on secure desktops and resumes on the normal desktop.
+
+Windows runtime acceptance (requires a Windows 10/11 x64 machine and a paired peer):
+
+1. Install from a standard account using administrator consent. Confirm files in
+   Program Files, service account LocalSystem, automatic startup, and private-LAN
+   firewall rules. Confirm standard users cannot modify executable/DLLs or read
+   ProgramData credentials, and cannot open the service named pipe. Opening
+   Settings must request elevation; portable instances must still work without it.
+   Confirm standard users can list `ProgramData\Mousehop` and read `config.toml`,
+   `service.log` and `panic.log` without elevation, but cannot modify those files.
+   Repeat on an upgrade with existing configuration/key files and confirm that
+   `identity.pem` remains unreadable and its contents/pairing are preserved.
+2. Pair a peer from elevated Settings, save configuration, close Settings, and
+   confirm sharing continues. Reboot without logging in and control the console
+   login screen using that peer. Windows Hello/credential-provider restrictions
+   remain those of Windows. If policy requires Ctrl+Alt+Del, send the secure
+   attention sequence locally; Mousehop does not synthesize it.
+3. Log in, exercise ordinary and elevated applications, lock with Win+L, unlock,
+   and open/cancel/accept UAC on the secure desktop several times. Check keyboard,
+   mouse, all display edges, reconnection and absence of stuck modifiers/buttons.
+   Verify that clipboard data does not transfer while on a secure desktop.
+4. Repeat desktop transitions with modifiers/buttons held. Disconnect the peer,
+   stop/restart Mousehop from Services, and verify key/button cleanup. Kill a worker
+   and then a session broker from Task Manager; the supervisor must recover them
+   without leaving duplicates. Stop the service and ensure no workers remain.
+5. Switch local users, including logging out the last user; verify only the active
+   console session has a worker and that the same machine pairing is available.
+   RDP and simultaneous session sharing are outside this implementation's scope.
+6. Upgrade with the service and installed Settings running, then uninstall. Verify
+   successful stop, removal of service/firewall rules/shortcuts/binaries, retained
+   protected machine state, and successful reinstallation using that state.
+7. Leave an unrelated same-named portable executable running with a different
+   port: Prepare must not block it. With a portable listener on the service port,
+   check the PID/path confirmation; declining must leave it running. In silent
+   mode a port conflict must fail with those details and no confirmation dialog.
+   Confirm installation succeeds when PowerShell is disabled by machine policy.
+
+Automated checks: `cargo test -p mousehop-ipc -p mousehop --lib`,
+`cargo clippy --workspace --all-targets --all-features`, and a Windows-target
+cross-build. The Windows IPC test exercises exclusive binding, multiple clients,
+request/response delivery and pipe-server identity verification. Run it on Windows
+with `cargo test -p mousehop-ipc`; a macOS run cannot exercise Windows APIs.
+`cargo test -p mousehop-installer` covers full-path process selection and network
+byte order on all hosts. On Windows it also tests actual TCP/UDP listener ownership
+and current-process image-path queries without modifying services or firewall rules.

@@ -1,8 +1,9 @@
 use futures::{Stream, StreamExt, stream::SelectAll};
 #[cfg(unix)]
+use std::io::ErrorKind;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::{
-    io::ErrorKind,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -16,15 +17,15 @@ use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 
 #[cfg(windows)]
-use tokio::net::TcpListener;
+use tokio::net::windows::named_pipe::NamedPipeServer as PipeListener;
 #[cfg(windows)]
-use tokio::net::TcpStream;
+use tokio::net::windows::named_pipe::NamedPipeServer as PipeStream;
 
 use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
 
 pub struct AsyncFrontendListener {
     #[cfg(windows)]
-    listener: TcpListener,
+    listener: PipeListener,
     #[cfg(unix)]
     listener: UnixListener,
     #[cfg(unix)]
@@ -32,11 +33,11 @@ pub struct AsyncFrontendListener {
     #[cfg(unix)]
     line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
     #[cfg(windows)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<TcpStream>>>>,
+    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<PipeStream>>>>,
     #[cfg(unix)]
     tx_streams: Vec<WriteHalf<UnixStream>>,
     #[cfg(windows)]
-    tx_streams: Vec<WriteHalf<TcpStream>>,
+    tx_streams: Vec<WriteHalf<PipeStream>>,
 }
 
 impl AsyncFrontendListener {
@@ -71,14 +72,7 @@ impl AsyncFrontendListener {
         };
 
         #[cfg(windows)]
-        let listener = match TcpListener::bind("127.0.0.1:5252").await {
-            Ok(ls) => ls,
-            // some other mousehop instance has bound the socket in the meantime
-            Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                return Err(IpcListenerCreationError::AlreadyRunning);
-            }
-            Err(e) => return Err(IpcListenerCreationError::Bind(e)),
-        };
+        let listener = crate::windows::server(true).map_err(IpcListenerCreationError::Bind)?;
 
         let adapter = Self {
             listener,
@@ -100,7 +94,7 @@ impl AsyncFrontendListener {
         // TODO do simultaneously
         for tx in self.tx_streams.iter_mut() {
             // write len + payload
-            if tx.write(json.as_bytes()).await.is_err() {
+            if tx.write_all(json.as_bytes()).await.is_err() {
                 keep.push(false);
                 continue;
             }
@@ -129,7 +123,31 @@ impl Stream for AsyncFrontendListener {
             return Poll::Ready(Some(request));
         }
         let mut sync = false;
-        while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
+        loop {
+            #[cfg(unix)]
+            let stream = match self.listener.poll_accept(cx) {
+                Poll::Ready(Ok((stream, _))) => stream,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Pending => break,
+            };
+            #[cfg(windows)]
+            let stream = {
+                use std::future::Future;
+                let connected = {
+                    let future = self.listener.connect();
+                    std::pin::pin!(future).poll(cx)
+                };
+                match connected {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                    Poll::Pending => break,
+                }
+                let next = match crate::windows::server(false) {
+                    Ok(next) => next,
+                    Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                };
+                std::mem::replace(&mut self.listener, next)
+            };
             let (rx, tx) = tokio::io::split(stream);
             let buf_reader = BufReader::new(rx);
             let lines = buf_reader.lines();
@@ -143,5 +161,72 @@ impl Stream for AsyncFrontendListener {
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::{FrontendEvent, connect_async};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn pipe_roundtrip_multiple_clients_and_exclusive_listener() {
+        let mut listener = AsyncFrontendListener::new().await.unwrap();
+        assert!(AsyncFrontendListener::new().await.is_err());
+        let (mut first, mut writer) = connect_async(Some(Duration::from_secs(2))).await.unwrap();
+        assert!(matches!(
+            listener.next().await,
+            Some(Ok(FrontendRequest::Sync))
+        ));
+        let (mut second, _) = connect_async(Some(Duration::from_secs(2))).await.unwrap();
+        assert!(matches!(
+            listener.next().await,
+            Some(Ok(FrontendRequest::Sync))
+        ));
+        writer.request(FrontendRequest::Enumerate()).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), listener.next())
+                .await
+                .unwrap(),
+            Some(Ok(FrontendRequest::Enumerate()))
+        ));
+        listener
+            .broadcast(FrontendEvent::Error("roundtrip".into()))
+            .await;
+        for reader in [&mut first, &mut second] {
+            assert!(
+                matches!(tokio::time::timeout(Duration::from_secs(2), reader.next()).await.unwrap(), Some(Ok(FrontendEvent::Error(value))) if value == "roundtrip")
+            );
+        }
+
+        // GTK starts a blocking reader before sending button requests. A
+        // synchronous Windows file handle deadlocks writes behind that read.
+        let (mut reader, mut writer) = crate::connect_once().unwrap();
+        assert!(matches!(
+            listener.next().await,
+            Some(Ok(FrontendRequest::Sync))
+        ));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            reader.next_event()
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let writing = std::thread::spawn(move || writer.request(FrontendRequest::Create));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), listener.next())
+                .await
+                .unwrap(),
+            Some(Ok(FrontendRequest::Create))
+        ));
+        writing.join().unwrap().unwrap();
+        listener
+            .broadcast(FrontendEvent::Error("concurrent read/write".into()))
+            .await;
+        assert!(
+            matches!(reading.join().unwrap(), Some(Ok(FrontendEvent::Error(value))) if value == "concurrent read/write")
+        );
     }
 }

@@ -437,7 +437,9 @@ fn spawn_ipc_reader(
 /// `true`. Returns `false` if the daemon never came back (an
 /// intentional shutdown), so the caller exits the GUI as before.
 async fn reconnect_ipc(window: &Window, sender: &async_channel::Sender<IpcMsg>) -> bool {
-    const ATTEMPTS: u32 = 10; // ~10s, polled once per second
+    // SCM recovery and desktop transitions can take longer than ten seconds.
+    const ATTEMPTS: u32 = if cfg!(windows) { 60 } else { 10 };
+    window.disconnect_frontend();
     log::warn!("daemon IPC dropped — trying to reconnect to a restarted daemon");
     for _ in 0..ATTEMPTS {
         glib::timeout_future_seconds(1).await;
@@ -463,6 +465,20 @@ fn build_ui(app: &Application) {
         Ok(conn) => conn,
         Err(e) => {
             log::error!("{e}");
+            #[cfg(windows)]
+            unsafe {
+                use windows::{
+                    Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
+                    core::{PCWSTR, w},
+                };
+                let message = mousehop_ipc::windows::wide(&e.to_string());
+                MessageBoxW(
+                    None,
+                    PCWSTR(message.as_ptr()),
+                    w!("Mousehop"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
             process::exit(1);
         }
     };

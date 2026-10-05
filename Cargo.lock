@@ -2390,6 +2390,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mousehop-installer"
+version = "0.18.0"
+dependencies = [
+ "toml 0.8.23",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "mousehop-ipc"
 version = "0.18.0"
 dependencies = [
@@ -2401,6 +2409,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "windows 0.61.3",
 ]
 
 [[package]]

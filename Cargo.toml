@@ -1,11 +1,14 @@
 [workspace]
 resolver = "2"
+# Keep plain `cargo run` focused on the app, not the installer bootstrap helper.
+default-members = ["mousehop"]
 members = [
     "input-capture",
     "input-emulation",
     "input-event",
     "mousehop",
     "mousehop-ipc",
+    "mousehop-installer",
     "mousehop-cli",
     "mousehop-gtk",
     "mousehop-proto",

@@ -1,0 +1,25 @@
+[package]
+name = "mousehop-installer"
+version.workspace = true
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Native Windows lifecycle helper for the Mousehop installer"
+
+[target.'cfg(windows)'.dependencies]
+toml = "0.8"
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Networking_WinSock",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Services",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

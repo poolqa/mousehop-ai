@@ -118,7 +118,8 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
-                    if key == scancode::Linux::KeyCapsLock as u32 {
+                    let submitted = key_event(key, state);
+                    if !submitted || key == scancode::Linux::KeyCapsLock as u32 {
                         // Lock keys are discrete toggles. Never synthesize
                         // repeats: delayed release delivery must not flip the
                         // Windows lock state more than once.
@@ -133,7 +134,6 @@ impl Emulation for WindowsEmulation {
                             _ => {}
                         }
                     }
-                    key_event(key, state)
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
@@ -148,9 +148,13 @@ impl Emulation for WindowsEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.kill_repeat_task();
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.kill_repeat_task();
+    }
 
     fn display_bounds(&mut self) -> Option<(u32, u32)> {
         // Virtual-screen metrics cover the union of every monitor
@@ -230,7 +234,9 @@ impl WindowsEmulation {
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(repeat_delay).await;
             loop {
-                key_event(key, 1);
+                if !key_event(key, 1) {
+                    break;
+                }
                 tokio::time::sleep(repeat_interval).await;
             }
         });
@@ -243,15 +249,29 @@ impl WindowsEmulation {
     }
 }
 
-fn send_input_safe(input: INPUT) {
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
+thread_local! {
+    static INPUT_BLOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn submit_input_once(submit: impl FnOnce() -> u32) -> bool {
+    let submitted = submit() == 1;
+    INPUT_BLOCKED.with(|blocked| {
+        let was_blocked = blocked.replace(!submitted);
+        if !submitted && !was_blocked {
+            log::warn!(
+                "SendInput rejected an event; skipping it to keep heartbeat and desktop shutdown responsive"
+            );
+        } else if submitted && was_blocked {
+            log::info!("SendInput recovered; input injection resumed");
         }
-    }
+    });
+    submitted
+}
+
+fn send_input_safe(input: INPUT) -> bool {
+    // Desktop switches can reject injection indefinitely. Never retry on the
+    // daemon's runtime thread: it also services DTLS heartbeats and WorkerStop.
+    submit_input_once(|| unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) })
 }
 
 fn send_mouse_input(mi: MOUSEINPUT) {
@@ -261,11 +281,11 @@ fn send_mouse_input(mi: MOUSEINPUT) {
     });
 }
 
-fn send_keyboard_input(ki: KEYBDINPUT) {
+fn send_keyboard_input(ki: KEYBDINPUT) -> bool {
     send_input_safe(INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
-    });
+    })
 }
 fn rel_mouse(dx: i32, dy: i32) {
     let mi = MOUSEINPUT {
@@ -346,10 +366,10 @@ fn is_modifier_key(key: u32) -> bool {
     )
 }
 
-fn key_event(key: u32, state: u8) {
+fn key_event(key: u32, state: u8) -> bool {
     let scancode = match linux_keycode_to_windows_scancode(key) {
         Some(code) => code,
-        None => return,
+        None => return false,
     };
     let extended = scancode > 0xff;
     let scancode = scancode & 0xff;
@@ -367,7 +387,7 @@ fn key_event(key: u32, state: u8) {
         time: 0,
         dwExtraInfo: 0,
     };
-    send_keyboard_input(ki);
+    send_keyboard_input(ki)
 }
 
 fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
@@ -392,7 +412,22 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::union_to_screen;
+    use super::{INPUT_BLOCKED, submit_input_once, union_to_screen};
+    use std::cell::Cell;
+
+    #[test]
+    fn rejected_input_returns_without_retry_and_later_input_recovers() {
+        INPUT_BLOCKED.with(|blocked| blocked.set(false));
+        let mut calls = 0;
+        assert!(!submit_input_once(|| {
+            calls += 1;
+            0
+        }));
+        assert_eq!(calls, 1);
+        assert!(INPUT_BLOCKED.with(Cell::get));
+        assert!(submit_input_once(|| 1));
+        assert!(!INPUT_BLOCKED.with(Cell::get));
+    }
 
     #[test]
     fn union_to_screen_is_identity_when_the_primary_is_top_left() {

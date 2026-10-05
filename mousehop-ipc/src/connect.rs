@@ -12,25 +12,29 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 #[cfg(windows)]
-use std::net::TcpStream;
+use crate::windows::PipeStream;
+#[cfg(windows)]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 #[cfg(unix)]
 type FrontendStream = UnixStream;
 #[cfg(windows)]
-type FrontendStream = TcpStream;
+type FrontendStream = PipeStream;
 
 pub struct FrontendEventReader {
     #[cfg(unix)]
     lines: Lines<BufReader<UnixStream>>,
     #[cfg(windows)]
-    lines: Lines<BufReader<TcpStream>>,
+    lines: Lines<BufReader<PipeStream>>,
 }
 
 pub struct FrontendRequestWriter {
     #[cfg(unix)]
     line_writer: LineWriter<UnixStream>,
     #[cfg(windows)]
-    line_writer: LineWriter<TcpStream>,
+    line_writer: LineWriter<PipeStream>,
 }
 
 impl FrontendEventReader {
@@ -114,11 +118,21 @@ fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 }
 
 #[cfg(windows)]
-fn wait_for_service() -> Result<TcpStream, ConnectionError> {
+fn wait_for_service() -> Result<PipeStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
+    let deadline =
+        crate::windows::service_mode().then(|| std::time::Instant::now() + Duration::from_secs(30));
     loop {
-        if let Ok(stream) = connect_to_service() {
-            break Ok(stream);
+        match connect_to_service() {
+            Ok(stream) => break Ok(stream),
+            Err(ConnectionError::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(e.into());
+            }
+            Err(_) => {}
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut,
+                "Mousehop input worker did not become ready within 30 seconds. See C:\\ProgramData\\Mousehop\\service.log and panic.log from an administrator terminal.").into());
         }
         thread::sleep(exponential_back_off(&mut duration));
     }
@@ -130,8 +144,16 @@ fn connect_to_path(socket_path: &Path) -> Result<UnixStream, ConnectionError> {
 }
 
 #[cfg(windows)]
-fn connect_to_service() -> Result<TcpStream, ConnectionError> {
-    Ok(TcpStream::connect("127.0.0.1:5252")?)
+fn connect_to_service() -> Result<PipeStream, ConnectionError> {
+    // SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION: never lend our
+    // elevated token to a pipe server through impersonation.
+    let stream = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(0x0010_0000 | 0x0001_0000 | 0x4000_0000)
+        .open(crate::windows::pipe_name()?)?;
+    crate::windows::verify_server(&stream)?;
+    Ok(PipeStream(stream))
 }
 
 fn exponential_back_off(duration: &mut Duration) -> Duration {

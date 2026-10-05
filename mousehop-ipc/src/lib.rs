@@ -1011,3 +1011,6 @@ mod tests {
         assert_eq!(decoded.crossing_modifier, CrossingModifier::Super);
     }
 }
+
+#[cfg(windows)]
+pub mod windows;

@@ -57,14 +57,45 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     let serialized = cert.serialize_pem();
     let parent = path.parent().expect("is a path");
     fs::create_dir_all(parent)?;
+    #[cfg(not(windows))]
     let f = File::create(path)?;
+    #[cfg(windows)]
+    let f = if mousehop_ipc::windows::service_mode() {
+        use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+        use windows::{
+            Win32::Storage::FileSystem::{
+                CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+            },
+            core::PCWSTR,
+        };
+        // The shared directory is readable by Users. Set the private key's
+        // non-inheriting DACL at creation, before any key bytes are written.
+        let descriptor =
+            mousehop_ipc::windows::SecurityDescriptor::new("D:P(A;;FA;;;SY)(A;;FA;;;BA)")?;
+        let attributes = descriptor.attributes();
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            let handle = CreateFileW(
+                PCWSTR(name.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                Some(&attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            .map_err(io::Error::from)?;
+            File::from_raw_handle(handle.0)
+        }
+    } else {
+        File::create(path)?
+    };
     #[cfg(unix)]
     {
         let mut perm = f.metadata()?.permissions();
         perm.set_mode(0o400); /* r-- --- --- */
         f.set_permissions(perm)?;
     }
-    /* FIXME windows permissions */
     let mut writer = BufWriter::new(f);
     writer.write_all(serialized.as_bytes())?;
     Ok(cert)

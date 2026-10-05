@@ -54,9 +54,73 @@ fn main() {
     #[cfg(windows)]
     mousehop::windows_console::attach_parent();
 
+    #[cfg(windows)]
+    if mousehop_ipc::windows::service_mode() && std::env::args().len() == 1 {
+        match mousehop::windows_service::elevate_settings() {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        }
+    }
+
     // init logging
     let env = Env::default().filter_or("MOUSEHOP_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    let mut logger = env_logger::Builder::from_env(env);
+    #[cfg(windows)]
+    if std::env::args().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "windows-service" | "windows-session" | "windows-worker"
+        )
+    }) {
+        if let Err(e) = mousehop_ipc::windows::require_system() {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+        // The installer creates this directory with SYSTEM/admin-only ACLs.
+        let log_file = mousehop::windows_service::data_dir().and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p.join("service.log"))
+        });
+        match log_file {
+            Ok(file) => {
+                logger.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                eprintln!("Cannot open service log: {e}");
+                process::exit(1);
+            }
+        }
+    }
+    logger.init();
+    #[cfg(windows)]
+    mousehop::panic_log::install(if mousehop::windows_service::worker_mode() {
+        "windows-worker"
+    } else if std::env::args().any(|a| a == "windows-service" || a == "windows-session") {
+        "windows-service"
+    } else {
+        "gui"
+    });
+    #[cfg(windows)]
+    {
+        let result = match std::env::args().nth(1).as_deref() {
+            Some("windows-service") => Some(mousehop::windows_service::dispatch()),
+            Some("windows-session") => Some(mousehop::windows_service::session_broker()),
+            _ => None,
+        };
+        if let Some(result) = result {
+            if let Err(e) = result {
+                log::error!("{e}");
+                process::exit(1);
+            }
+            return;
+        }
+    }
 
     // Route panics to a durable logfile before anything else can run.
     // The daemon child's stderr is /dev/null under LaunchServices, so
@@ -65,11 +129,13 @@ fn main() {
     // see — which is exactly why the screensaver-lockup crash went
     // undiagnosed. Tag each record by role so a shared log file stays
     // attributable.
+    #[cfg(not(windows))]
     let role = if std::env::args().skip(1).any(|a| a == "daemon") {
         "daemon"
     } else {
         "gui"
     };
+    #[cfg(not(windows))]
     mousehop::panic_log::install(role);
 
     // On a Linux `cargo install` (no AUR / Flatpak / distro package)
@@ -81,6 +147,10 @@ fn main() {
 
     if let Err(e) = run() {
         log::error!("{e}");
+        #[cfg(windows)]
+        if mousehop_ipc::windows::service_mode() && std::env::args().len() == 1 {
+            mousehop::windows_service::show_startup_error(&e.to_string());
+        }
         process::exit(1);
     }
 }
@@ -92,6 +162,11 @@ fn run() -> Result<(), MousehopError> {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
             Command::Cli(cli_args) => run_async(mousehop_cli::run(cli_args))?,
+            #[cfg(windows)]
+            Command::WindowsWorker => {
+                mousehop_ipc::windows::require_system()?;
+                run_async(run_service(config))?;
+            }
             Command::Daemon => {
                 // if daemon is specified we run the service
                 match run_async(run_service(config)) {
@@ -130,10 +205,17 @@ fn run() -> Result<(), MousehopError> {
                 // daemon supervisor (the screensaver-panic crash this
                 // guards against is macOS-specific). Keep the original
                 // spawn → run → kill lifecycle.
-                let mut service = start_service()?;
+                let mut service = if mousehop_ipc::windows::service_mode() {
+                    mousehop::windows_service::ensure_running()?;
+                    None
+                } else {
+                    Some(start_service()?)
+                };
                 let res = mousehop_gtk::run(gui_build_info());
-                let _ = service.kill();
-                let _ = service.wait();
+                if let Some(service) = service.as_mut() {
+                    let _ = service.kill();
+                    let _ = service.wait();
+                }
                 res?;
             }
             #[cfg(not(feature = "gtk"))]

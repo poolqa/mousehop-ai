@@ -45,6 +45,22 @@ pub fn local_commit() -> [u8; 8] {
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "mousehop.pem";
 
+fn default_config_path() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if mousehop_ipc::windows::service_mode() {
+        return Ok(crate::windows_service::data_dir()?.join(CONFIG_FILE_NAME));
+    }
+    Ok(default_path()?.join(CONFIG_FILE_NAME))
+}
+
+fn default_certificate_path() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if mousehop_ipc::windows::service_mode() {
+        return Ok(crate::windows_service::data_dir()?.join("identity.pem"));
+    }
+    Ok(default_path()?.join(CERT_FILE_NAME))
+}
+
 fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
     let default_path = {
@@ -172,6 +188,10 @@ pub enum Command {
     Cli(CliArgs),
     /// run in daemon mode
     Daemon,
+    /// Internal LocalSystem desktop worker (launched by the Windows service).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsWorker,
     /// Add (or, with --remove, delete) a host-firewall rule allowing
     /// mousehop's UDP port inbound — for the detected firewall
     /// (ufw/firewalld/nftables/iptables on Linux, Windows Firewall).
@@ -463,10 +483,12 @@ impl Config {
         let args = Args::parse();
 
         // --config <file> overrules default location
-        let config_path = args
-            .config
-            .clone()
-            .unwrap_or(default_path()?.join(CONFIG_FILE_NAME));
+        // Service workers have explicit machine paths and must not depend on
+        // a logged-in user's profile environment (including eager fallbacks).
+        let config_path = match args.config.clone() {
+            Some(path) => path,
+            None => default_config_path()?,
+        };
         let config_dir = config_path
             .parent()
             .expect("config directory")
@@ -495,11 +517,14 @@ impl Config {
         };
 
         // --cert-path <file> overrules default location
-        let cert_path = args
+        let cert_path = match args
             .cert_path
             .clone()
             .or(config_toml.as_ref().and_then(|c| c.cert_path.clone()))
-            .unwrap_or(default_path()?.join(CERT_FILE_NAME));
+        {
+            Some(path) => path,
+            None => default_certificate_path()?,
+        };
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
         let watcher = RecommendedWatcher::new(

@@ -83,6 +83,11 @@ fn log_file_path() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn log_file_path() -> Option<PathBuf> {
+    if mousehop_ipc::windows::service_mode() {
+        return crate::windows_service::data_dir()
+            .ok()
+            .map(|p| p.join("panic.log"));
+    }
     let mut p = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
     p.push("Mousehop");
     p.push("logs");

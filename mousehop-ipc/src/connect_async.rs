@@ -13,20 +13,20 @@ use tokio_stream::wrappers::LinesStream;
 use tokio::net::UnixStream;
 
 #[cfg(windows)]
-use tokio::net::TcpStream;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient as PipeStream};
 
 pub struct AsyncFrontendEventReader {
     #[cfg(unix)]
     lines_stream: LinesStream<BufReader<ReadHalf<UnixStream>>>,
     #[cfg(windows)]
-    lines_stream: LinesStream<BufReader<ReadHalf<TcpStream>>>,
+    lines_stream: LinesStream<BufReader<ReadHalf<PipeStream>>>,
 }
 
 pub struct AsyncFrontendRequestWriter {
     #[cfg(unix)]
     tx: WriteHalf<UnixStream>,
     #[cfg(windows)]
-    tx: WriteHalf<TcpStream>,
+    tx: WriteHalf<PipeStream>,
 }
 
 impl Stream for AsyncFrontendEventReader {
@@ -69,7 +69,7 @@ pub async fn connect_async(
     #[cfg(unix)]
     let (rx, tx): (ReadHalf<UnixStream>, WriteHalf<UnixStream>) = tokio::io::split(stream);
     #[cfg(windows)]
-    let (rx, tx): (ReadHalf<TcpStream>, WriteHalf<TcpStream>) = tokio::io::split(stream);
+    let (rx, tx): (ReadHalf<PipeStream>, WriteHalf<PipeStream>) = tokio::io::split(stream);
     let buf_reader = BufReader::new(rx);
     let lines = buf_reader.lines();
     let lines_stream = LinesStream::new(lines);
@@ -94,11 +94,19 @@ async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 }
 
 #[cfg(windows)]
-async fn wait_for_service() -> Result<TcpStream, ConnectionError> {
+async fn wait_for_service() -> Result<PipeStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect("127.0.0.1:5252").await {
-            break Ok(stream);
+        match ClientOptions::new()
+            .security_qos_flags(0x0001_0000)
+            .open(crate::windows::pipe_name()?)
+        {
+            Ok(stream) => {
+                crate::windows::verify_server(&stream)?;
+                break Ok(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(e.into()),
+            Err(_) => {}
         }
         tokio::time::sleep(exponential_back_off(&mut duration)).await;
     }

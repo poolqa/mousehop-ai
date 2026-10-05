@@ -26,3 +26,6 @@ pub mod panic_log;
 pub mod service;
 #[cfg(windows)]
 pub mod windows_console;
+
+#[cfg(windows)]
+pub mod windows_service;

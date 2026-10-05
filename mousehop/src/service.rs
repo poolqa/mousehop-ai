@@ -47,7 +47,11 @@ async fn shutdown_signal() -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        signal::ctrl_c().await
+        if crate::windows_service::worker_mode() {
+            crate::windows_service::worker_shutdown().await
+        } else {
+            signal::ctrl_c().await
+        }
     }
 }
 
@@ -316,14 +320,27 @@ impl Service {
                 .collect();
             Arc::new(std::sync::Mutex::new(initial))
         };
-        let clipboard_monitor =
+        let allow_clipboard = {
+            #[cfg(windows)]
+            {
+                !crate::windows_service::secure_desktop()
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        };
+        let clipboard_monitor = if allow_clipboard {
             match ClipboardMonitor::with_suppression(clipboard_suppression.clone()) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     log::warn!("clipboard monitor unavailable: {e}; clipboard sync disabled");
                     None
                 }
-            };
+            }
+        } else {
+            None
+        };
         let service = Self {
             config,
             capture,
@@ -1418,6 +1435,7 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
+        log::info!("Authorizing incoming peer certificate {fp}");
         // New authorizations land with default post-processing; the
         // user can tune natural-scroll / sensitivity from the
         // expanded row in the Incoming Connections list.
@@ -1571,6 +1589,10 @@ impl Service {
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle) {
+        #[cfg(windows)]
+        if crate::windows_service::worker_mode() {
+            return; // Never execute user-configured shell hooks as LocalSystem.
+        }
         let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
             return;
         };

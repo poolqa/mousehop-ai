@@ -172,6 +172,9 @@ impl MousehopListener {
                         Ok(())
                     } else {
                         let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
+                        log::warn!(
+                            "Incoming DTLS authorization rejected for certificate {fingerprint}; authorize this peer's current fingerprint in Mousehop Settings"
+                        );
                         connection_attempts
                             .lock()
                             .expect("lock")

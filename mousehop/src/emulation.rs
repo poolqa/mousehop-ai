@@ -855,6 +855,8 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Clipboard { from_fingerprint, content } => {
+                                #[cfg(windows)]
+                                if crate::windows_service::secure_desktop() { continue; }
                                 let receive_ok = self.addr_to_fingerprint
                                     .get(&addr)
                                     .and_then(|fp| self.incoming_peers.get(fp))
@@ -889,6 +891,8 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::ClipboardStreamOffer(stream_offer) => {
+                                #[cfg(windows)]
+                                if crate::windows_service::secure_desktop() { continue; }
                                 let receive_ok = self.addr_to_fingerprint
                                     .get(&addr)
                                     .and_then(|fp| self.incoming_peers.get(fp))

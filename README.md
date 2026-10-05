@@ -98,6 +98,61 @@ It can be used as a remote control for any device supported by Mousehop.
 <details>
     <summary>Windows</summary>
 
+**Windows Service installer (Windows 10/11 x64).** Build the installer with
+`scripts/package-windows-installer.sh` (on macOS, install NSIS with
+`brew install nsis` first). It reuses `scripts/package-windows.sh` and produces
+`dist/mousehop-windows-x86_64-setup.exe`. To package an existing ZIP built from
+service-capable source, pass `--package-zip /path/to/package.zip`; old portable
+releases are rejected. `--runtime-zip` selects the GTK runtime for a fresh build.
+
+Run Setup as administrator. It installs to `C:\Program Files\Mousehop` (using
+Windows' actual Program Files location), registers the **Mousehop** LocalSystem
+service with automatic startup/recovery, and adds inbound TCP/UDP firewall rules
+for **Private and Domain / LocalSubnet** networks. For a trusted LAN Windows
+classifies as **Public**, select **Also allow incoming connections on Public
+networks (local subnet only)** during Setup. Without this option, Windows may
+connect out successfully while incoming connections are blocked, even for an
+authorized peer. Setup remembers the selection on upgrades and reports active
+firewall profiles and policy restrictions in installation details. Open
+**Mousehop Settings** from Start and
+approve UAC to configure trusted peers. Settings can be closed while sharing
+continues; use Services or elevated `Stop-Service Mousehop` to stop sharing.
+
+Service mode uses a separate machine identity and configuration in
+`%ProgramData%\Mousehop`; pair devices again before testing login-screen access.
+Only SYSTEM and elevated administrators can read/change this state. Existing
+portable settings are not imported. Upgrades and uninstall retain this directory;
+uninstall removes the service, its firewall rules, shortcuts and installed files.
+The installer uses a native Windows helper and requires no PowerShell. It stops
+installed Settings processes during upgrades/removal, so save pending changes
+first. Same-named portable instances do not block installation; a portable daemon
+using the service port is identified by PID/path and can be stopped with consent.
+The service startup log is
+`%ProgramData%\Mousehop\service.log`.
+
+Installed Settings uses the same machine configuration and identity as the service.
+Opening Settings starts a stopped service; IPC reconnects after worker replacement.
+Windows pipe reads and writes use separate overlapped operations so adding an
+Outgoing client cannot block behind the background reader. Startup failures show
+a dialog, and installed-process panics are recorded in
+`%ProgramData%\Mousehop\panic.log`. Standard users can open the shared directory
+and read configuration and logs in Explorer. They cannot modify shared state;
+the private key in `identity.pem` remains readable only by SYSTEM and elevated
+administrators. Settings still requires UAC to change pairing/configuration.
+
+The service launches an input worker as SYSTEM in the **physical console
+session**, on either the normal desktop or Windows' login/lock/UAC (`Winlogon`)
+desktop. Desktop/session changes gracefully stop the old worker and start a new
+one; peers and Settings reconnect, so a brief interruption is expected. This
+also means authorized peers have access to administrator windows and login input.
+Shell hooks are disabled in service mode; clipboard sync is disabled on secure
+desktops. RDP/multiple simultaneous sessions and synthetic **Ctrl+Alt+Del** are
+not supported. UAC and secure-attention policies are not changed by the installer.
+Windows runtime acceptance checks are listed in [DOC.md](DOC.md#windows-service-installation-and-validation);
+cross-compilation alone does not verify secure-desktop input on a target machine.
+
+**Portable ZIP.** The following instructions apply to the portable build:
+
 - Download `mousehop-windows-x86_64.zip` from the releases page and extract it somewhere permanent — the GTK DLLs next to `mousehop.exe` are required, so keep the folder intact
 - Run `mousehop.exe`. No console window appears, and none has to stay open
 

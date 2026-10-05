@@ -20,6 +20,7 @@
 //! to exist anyway to avoid daemon-child duplication, so the
 //! activation signal piggybacks on the same socket.
 
+#[cfg(unix)]
 use std::io::ErrorKind;
 use std::sync::OnceLock;
 
@@ -30,14 +31,9 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::net::{TcpListener, TcpStream};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use thiserror::Error;
-
-/// TCP port used as the GUI single-instance lock on Windows. One
-/// past the daemon's `127.0.0.1:5252` (see `mousehop_ipc`'s listener).
-#[cfg(windows)]
-const GUI_LOCK_PORT: u16 = 5253;
 
 /// Filename of the GUI lock socket on Unix. Lives alongside the
 /// daemon's `mousehop-socket.sock` — in `$XDG_RUNTIME_DIR` on Linux,
@@ -61,6 +57,10 @@ pub(crate) enum AcquireError {
 /// ping on this side. Dropping the guard releases the lock and
 /// tears down the listener thread on the next accept.
 pub(crate) struct SingleInstanceGuard {
+    #[cfg(windows)]
+    _mutex: OwnedHandle,
+    #[cfg(windows)]
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(unix)]
     socket_path: PathBuf,
     // Listener is moved into the listener thread once
@@ -121,20 +121,72 @@ pub(crate) fn acquire() -> Result<SingleInstanceGuard, AcquireError> {
 
 #[cfg(windows)]
 pub(crate) fn acquire() -> Result<SingleInstanceGuard, AcquireError> {
-    match TcpListener::bind(("127.0.0.1", GUI_LOCK_PORT)) {
-        Ok(listener) => {
-            spawn_listener_thread(listener);
-            Ok(SingleInstanceGuard {})
-        }
-        Err(e) if e.kind() == ErrorKind::AddrInUse => {
-            // Mirror the Unix path: ping the existing instance so it
-            // raises its window before we exit.
-            if let Ok(stream) = TcpStream::connect(("127.0.0.1", GUI_LOCK_PORT)) {
-                drop(stream);
+    use mousehop_ipc::windows::{SecurityDescriptor, process_sid, service_mode, wide};
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_OBJECT_0},
+            System::Threading::{
+                CreateEventW, CreateMutexW, GetCurrentProcess, SetEvent, WaitForSingleObject,
+            },
+        },
+        core::PCWSTR,
+    };
+    let result = (|| -> std::io::Result<SingleInstanceGuard> {
+        let sid = process_sid(unsafe { GetCurrentProcess() })?;
+        let suffix = if service_mode() {
+            "Service"
+        } else {
+            "Portable"
+        };
+        let name = format!("Local\\Mousehop.Settings.{suffix}.{sid}");
+        let descriptor = SecurityDescriptor::new(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})"))?;
+        let attributes = descriptor.attributes();
+        let event_name = wide(&format!("{name}.Present"));
+        let mutex_name = wide(&format!("{name}.Mutex"));
+        unsafe {
+            let raw = CreateMutexW(Some(&attributes), false, PCWSTR(mutex_name.as_ptr()))?;
+            let exists = GetLastError() == ERROR_ALREADY_EXISTS;
+            let mutex = OwnedHandle::from_raw_handle(raw.0);
+            let raw = CreateEventW(Some(&attributes), false, false, PCWSTR(event_name.as_ptr()))?;
+            let event = OwnedHandle::from_raw_handle(raw.0);
+            if exists {
+                SetEvent(HANDLE(event.as_raw_handle()))?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Settings already open",
+                ));
             }
-            Err(AcquireError::AlreadyRunning)
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let listener_stop = stop.clone();
+            std::thread::Builder::new()
+                .name("mousehop-gui-present".into())
+                .spawn(move || {
+                    while !listener_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if WaitForSingleObject(HANDLE(event.as_raw_handle()), 250) == WAIT_OBJECT_0
+                        {
+                            fire_present();
+                        }
+                    }
+                })?;
+            Ok(SingleInstanceGuard {
+                _mutex: mutex,
+                stop,
+            })
         }
-        Err(e) => Err(AcquireError::Bind(e)),
+    })();
+    result.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            AcquireError::AlreadyRunning
+        } else {
+            AcquireError::Bind(e)
+        }
+    })
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -150,27 +202,6 @@ pub(crate) fn set_present_callback(cb: impl Fn() + Send + Sync + 'static) {
 
 #[cfg(unix)]
 fn spawn_listener_thread(listener: UnixListener) {
-    std::thread::Builder::new()
-        .name("mousehop-gui-present".into())
-        .spawn(move || {
-            for incoming in listener.incoming() {
-                match incoming {
-                    Ok(stream) => {
-                        drop(stream);
-                        fire_present();
-                    }
-                    Err(e) => {
-                        log::warn!("gui-present listener accept failed: {e}");
-                        break;
-                    }
-                }
-            }
-        })
-        .expect("spawn gui-present listener thread");
-}
-
-#[cfg(windows)]
-fn spawn_listener_thread(listener: TcpListener) {
     std::thread::Builder::new()
         .name("mousehop-gui-present".into())
         .spawn(move || {

@@ -752,11 +752,25 @@ impl Window {
     }
 
     fn request(&self, request: FrontendRequest) {
-        let mut requester = self.imp().frontend_request_writer.borrow_mut();
-        let requester = requester.as_mut().unwrap();
-        if let Err(e) = requester.request(request) {
-            log::error!("error sending message: {e}");
+        let result = {
+            let mut writer = self.imp().frontend_request_writer.borrow_mut();
+            match writer.as_mut() {
+                Some(writer) => writer.request(request),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "Mousehop service is reconnecting. Please retry shortly.",
+                )),
+            }
         };
+        if let Err(e) = result {
+            log::error!("error sending message: {e}");
+            self.show_toast(&e.to_string());
+        }
+    }
+
+    pub(super) fn disconnect_frontend(&self) {
+        self.imp().frontend_request_writer.borrow_mut().take();
+        self.show_toast("Mousehop service disconnected. Reconnecting…");
     }
 
     /// Swap in a request writer for a freshly reconnected daemon (the
