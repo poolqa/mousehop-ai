@@ -3,6 +3,16 @@
   &nbsp;Mousehop
 </h1>
 
+> [!WARNING]
+> **This is an AI-modified fork of Mousehop.**
+>
+> The main changes include:
+> - Fixes for cross-platform operation between macOS and Windows.
+> - Chinese input method support.
+> - File transfer functionality.
+>
+> This fork may contain complex, unconventional, or unusual implementations, primarily intended to solve practical usage issues. It is not suitable for direct merging into the upstream project or other branches. Review and test each change before adopting it.
+
 [![CI](https://github.com/jondkinney/mousehop/actions/workflows/rust.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/rust.yml) [![Cachix](https://github.com/jondkinney/mousehop/actions/workflows/cachix.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/cachix.yml) [![Release](https://github.com/jondkinney/mousehop/actions/workflows/release.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/release.yml)
 
 [![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](./LICENSE)
