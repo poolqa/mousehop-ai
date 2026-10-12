@@ -216,6 +216,20 @@ which ensures clients can only be controlled directly and not indirectly through
 
 ## Windows service installation and validation
 
+Windows icon resources are committed in `mousehop/assets/windows` and linked
+into `mousehop.exe` by `embed-resource` for Windows targets (MSVC `rc.exe`,
+LLVM `llvm-rc`, or MinGW `windres`). Regenerate them from the existing SVGs with
+`bash scripts/make-windows-icons.sh` from the repository root; this requires
+`rsvg-convert` and ImageMagick. Resource ID 1 is the app icon; IDs 2/3 are the
+black/white tray glyphs, loaded at the system small-icon size without GTK SVG
+loaders. The tray owns and releases each loaded HICON.
+
+Manual icon verification on Windows 10/11: check Explorer and Task Manager
+(including daemon/worker processes), toggle light/dark taskbar themes, inspect
+the tray at 100% and 200% scaling, close/reopen settings through the tray, and
+restart Explorer to confirm the icon returns. Test the portable DLL-only ZIP
+as well as the installed application.
+
 Build on macOS with `scripts/package-windows-installer.sh`. Prerequisites are the
 existing `package-windows.sh` cross-build tools and NSIS (`brew install nsis`).
 `--package-zip` skips compilation and wraps a current, service-capable ZIP;

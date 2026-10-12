@@ -174,6 +174,10 @@ cursor return. A console-session change or service restart still reconnects.
 **Notification area.** Closing the settings window does not quit Mousehop — it
 hides to the notification area (the "system tray") and keeps sharing input.
 
+The Windows executable embeds the Mousehop app icon for Explorer and Task
+Manager, plus light/dark tray icons. Tray icons load directly from the EXE and
+do not require an SVG decoder in the portable runtime.
+
 - Left-click the tray icon to show or hide the settings window
 - Right-click it for **Open Mousehop** / **Quit Mousehop**
 - Quitting from that menu is the only thing that stops input sharing
