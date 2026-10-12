@@ -1,0 +1,4 @@
+// Keep the app first for Explorer/Task Manager. IDs 2/3 are used by windows_tray.rs.
+1 ICON "app.ico"
+2 ICON "tray-light.ico"
+3 ICON "tray-dark.ico"

@@ -92,9 +92,14 @@ if [[ -z "$llvm_prefix" ]] && command -v brew >/dev/null 2>&1; then
 fi
 llvm_readobj="${LLVM_READOBJ:-${llvm_prefix:+$llvm_prefix/bin/llvm-readobj}}"
 llvm_dlltool="${LLVM_DLLTOOL:-${llvm_prefix:+$llvm_prefix/bin/llvm-dlltool}}"
+llvm_rc="${LLVM_RC:-${llvm_prefix:+$llvm_prefix/bin/llvm-rc}}"
 if [[ -z "$llvm_readobj" || ! -x "$llvm_readobj" || -z "$llvm_dlltool" || ! -x "$llvm_dlltool" ]]; then
     echo "error: llvm-readobj and llvm-dlltool are required" >&2
     echo "Install them with: brew install llvm" >&2
+    exit 1
+fi
+if [[ -z "$llvm_rc" || ! -x "$llvm_rc" ]]; then
+    echo "error: llvm-rc is required to embed Windows icons (brew install llvm)" >&2
     exit 1
 fi
 
@@ -220,6 +225,7 @@ cd "$repo_root"
 PKG_CONFIG_ALLOW_CROSS_x86_64_pc_windows_msvc=1 \
 PKG_CONFIG_LIBDIR_x86_64_pc_windows_msvc="$prefix/lib/pkgconfig" \
 PKG_CONFIG_PATH_x86_64_pc_windows_msvc="$prefix/lib/pkgconfig" \
+RC_x86_64_pc_windows_msvc="$llvm_rc" \
 cargo xwin build --release --target "$target" -p mousehop
 
 exe="$repo_root/target/$target/release/mousehop.exe"

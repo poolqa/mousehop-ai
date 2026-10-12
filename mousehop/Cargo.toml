@@ -13,10 +13,12 @@ include = [
     # so they must ship in the published crate.
     "com.mousehop.Mousehop.desktop",
     "assets/com.mousehop.Mousehop.svg",
+    "assets/windows/*",
 ]
 
 [build-dependencies]
 shadow-rs = "1.2.0"
+embed-resource = "3.0"
 
 [dependencies]
 input-event = { workspace = true }
