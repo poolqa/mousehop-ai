@@ -33,13 +33,9 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use async_channel::Sender;
-use gtk::{gdk_pixbuf::Pixbuf, gio, glib};
+use gtk::{gio, glib};
 
-use windows::Win32::Foundation::{E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteObject, HBITMAP,
-};
+use windows::Win32::Foundation::{E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -47,12 +43,12 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, GetCursorPos, GetSystemMetrics, HICON, ICONINFO, MF_SEPARATOR,
-    MF_STRING, PostMessageW, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
-    SetForegroundWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
-    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WNDPROC,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, GetCursorPos, GetSystemMetrics, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+    MF_SEPARATOR, MF_STRING, PostMessageW, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
+    SM_CYSMICON, SetForegroundWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WNDCLASSW, WNDPROC, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -89,8 +85,8 @@ struct TrayState {
     /// costs the user their icon until the next launch.
     taskbar_created: u32,
     /// Which taskbar tint the current [`TrayState::icon`] was
-    /// rasterized for, so a `WM_SETTINGCHANGE` storm doesn't re-render
-    /// the SVG on every message.
+    /// loaded for, so a `WM_SETTINGCHANGE` storm doesn't reload
+    /// the icon on every message.
     light_taskbar: bool,
     /// When the icon last toggled the window, for the double-click
     /// debounce in [`toggle_from_click`].
@@ -186,7 +182,7 @@ fn install(tx: Sender<TrayCmd>) -> windows::core::Result<()> {
         )?;
 
         let light_taskbar = taskbar_is_light();
-        let icon = render_icon(light_taskbar);
+        let icon = load_tray_icon(light_taskbar);
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         if taskbar_created == 0 {
             log::warn!(
@@ -433,7 +429,7 @@ unsafe fn add_icon(hwnd: HWND, icon: HICON) -> bool {
     let mut data = icon_data(hwnd);
     data.uFlags = NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = WM_MOUSEHOP_TRAY;
-    // A failed glyph render leaves a null HICON; claiming NIF_ICON
+    // A failed resource load leaves a null HICON; claiming NIF_ICON
     // with a null handle risks the whole NIM_ADD being rejected,
     // while adding without it still claims a (blank) clickable slot —
     // which beats having no way back to a hidden window.
@@ -487,7 +483,7 @@ fn readd_icon() {
 
 /// Re-tint the glyph when the user flips between light and dark.
 ///
-/// Decide, render, and swap under a single borrow, *before* the
+/// Decide, load, and swap under a single borrow, *before* the
 /// `Shell_NotifyIcon` call. A theme switch broadcasts several
 /// `WM_SETTINGCHANGE`s, and while `modify_icon`'s SendMessage to the
 /// taskbar blocks, Windows dispatches the next one of the burst
@@ -495,24 +491,23 @@ fn readd_icon() {
 /// modify would let both calls claim the same stale icon and destroy
 /// it twice. Swapping first means the re-entrant call sees the
 /// updated tint and bails, and each icon handle has exactly one
-/// owner at all times. (The render inside the borrow is fine: GDI
-/// and gdk-pixbuf calls don't pump messages; only SendMessage-style
-/// calls do.)
+/// owner at all times. (Loading these resources does not pump messages;
+/// only SendMessage-style calls do.)
 fn refresh_icon_for_theme() {
     let light_taskbar = taskbar_is_light();
     let Some((hwnd, icon, stale_icon)) = TRAY.with(|cell| {
         let mut tray = cell.borrow_mut();
         let tray = tray.as_mut()?;
         // WM_SETTINGCHANGE fires for far more than the colour scheme;
-        // only re-rasterize when the taskbar actually flipped.
+        // only reload when the taskbar actually flipped.
         if tray.light_taskbar == light_taskbar {
             return None;
         }
-        let icon = render_icon(light_taskbar);
+        let icon = load_tray_icon(light_taskbar);
         if icon.is_invalid() {
             // Keep the old (wrongly tinted, but visible) glyph; the
             // stale flag makes the next WM_SETTINGCHANGE retry.
-            log::warn!("windows_tray: re-render for theme change failed — keeping the old glyph");
+            log::warn!("windows_tray: reload for theme change failed — keeping the old glyph");
             return None;
         }
         let stale_icon = std::mem::replace(&mut tray.icon, icon);
@@ -572,170 +567,38 @@ fn taskbar_is_light() -> bool {
     status.0 == 0 && value != 0
 }
 
-/// Rasterize the shared tray glyph at notification-area size and wrap
-/// it in an `HICON`.
-///
-/// Unlike the Linux and macOS trays, we choose the ink ourselves:
-/// StatusNotifierItem hosts and NSStatusItem template images
-/// re-colour a silhouette to match their bar, but `Shell_NotifyIcon`
-/// takes a finished bitmap, so a white glyph would simply vanish on a
-/// light taskbar.
-///
-/// Returns a null `HICON` if anything fails — the icon still occupies
-/// (and responds in) its slot, blank, which beats having no way back
-/// to a hidden window.
-fn render_icon(light_taskbar: bool) -> HICON {
-    // Distinct from the desktop icon: a tight viewBox and simple
-    // silhouette that stays readable at 16-22 px. See
-    // resources/icons/mousehop-tray.svg.
-    const SVG_RESOURCE: &str = "/com/mousehop/Mousehop/icons/mousehop-tray.svg";
-    let ink = if light_taskbar { "#000000" } else { "#ffffff" };
-
-    // `max(16)` guards against a hostile or unset metric; the shell
-    // rescales anything it doesn't like anyway.
+/// Load a DPI-sized, pre-rendered glyph from the executable's resources.
+/// No GdkPixbuf SVG loader or external icon file is needed on Windows.
+fn load_tray_icon(light_taskbar: bool) -> HICON {
+    // IDs match mousehop/assets/windows/mousehop.rc. LoadImageW without
+    // LR_SHARED gives each load an owned handle that DestroyIcon can release.
+    let resource_id = if light_taskbar { 2 } else { 3 };
     let width = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
     let height = unsafe { GetSystemMetrics(SM_CYSMICON) }.max(16);
-
-    let Some(pixbuf) = render_svg(SVG_RESOURCE, ink, width, height) else {
-        return HICON::default();
-    };
-    unsafe { icon_from_pixbuf(&pixbuf) }.unwrap_or_default()
-}
-
-/// Render a bundled SVG resource to a pixbuf, substituting the ink
-/// colour the source paints with.
-fn render_svg(resource: &str, ink: &str, width: i32, height: i32) -> Option<Pixbuf> {
-    let raw = match gio::resources_lookup_data(resource, gio::ResourceLookupFlags::NONE) {
-        Ok(raw) => raw,
+    match load_icon_resource(resource_id, width, height) {
+        Ok(icon) => icon,
         Err(e) => {
-            log::warn!("windows_tray: load SVG resource: {e}");
-            return None;
-        }
-    };
-    let svg = match std::str::from_utf8(&raw) {
-        Ok(svg) => svg,
-        Err(e) => {
-            log::warn!("windows_tray: SVG is not UTF-8: {e}");
-            return None;
-        }
-    };
-    let recolored = svg.replace("currentColor", ink);
-    let bytes = glib::Bytes::from_owned(recolored.into_bytes());
-    let stream = gio::MemoryInputStream::from_bytes(&bytes);
-    match Pixbuf::from_stream_at_scale(&stream, width, height, true, gio::Cancellable::NONE) {
-        Ok(pixbuf) => Some(pixbuf),
-        Err(e) => {
-            log::warn!("windows_tray: rasterize tray SVG at {width}x{height}px: {e}");
-            None
+            log::warn!("windows_tray: load tray icon resource {resource_id}: {e}");
+            // The colored app icon remains visible on either taskbar theme.
+            load_icon_resource(1, width, height).unwrap_or_else(|e| {
+                log::warn!("windows_tray: load fallback app icon: {e}");
+                HICON::default()
+            })
         }
     }
 }
 
-/// Build an `HICON` from an RGBA pixbuf.
-///
-/// The colour plane is a top-down 32-bpp DIB section — `CreateDIBSection`
-/// rather than `CreateBitmap`, which is documented as unsuitable above
-/// 16 bpp. The mask plane is required by `ICONINFO` but left entirely
-/// zero: Windows alpha-blends from a 32-bpp colour bitmap's alpha
-/// channel, and an all-zero mask ("nothing is transparent") leaves that
-/// alpha in charge of the shape.
-unsafe fn icon_from_pixbuf(pixbuf: &Pixbuf) -> Option<HICON> {
-    if pixbuf.n_channels() != 4 || pixbuf.bits_per_sample() != 8 {
-        log::warn!("windows_tray: unexpected pixbuf format for the tray glyph");
-        return None;
-    }
-    let width = pixbuf.width();
-    let height = pixbuf.height();
-    let rowstride = pixbuf.rowstride() as usize;
-    let bytes = pixbuf.read_pixel_bytes();
-    let src = bytes.as_ref();
-
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            // Negative height selects top-down rows, matching
-            // gdk-pixbuf's layout. A positive one renders the glyph
-            // upside down.
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let color = match unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) } {
-        Ok(color) if !bits.is_null() => color,
-        Ok(color) => {
-            let _ = unsafe { DeleteObject(color.into()) };
-            log::warn!("windows_tray: CreateDIBSection returned no pixel buffer");
-            return None;
-        }
-        Err(e) => {
-            log::warn!("windows_tray: CreateDIBSection failed: {e}");
-            return None;
-        }
-    };
-
-    // gdk-pixbuf hands us RGBA rows padded to `rowstride`; GDI wants
-    // tightly packed BGRA.
-    let dst =
-        unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), (width * height * 4) as usize) };
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let s = y * rowstride + x * 4;
-            let d = (y * width as usize + x) * 4;
-            dst[d] = src[s + 2];
-            dst[d + 1] = src[s + 1];
-            dst[d + 2] = src[s];
-            dst[d + 3] = src[s + 3];
-        }
-    }
-
-    let Some(mask) = (unsafe { create_blank_mask(width, height) }) else {
-        let _ = unsafe { DeleteObject(color.into()) };
-        return None;
-    };
-
-    let icon_info = ICONINFO {
-        fIcon: TRUE,
-        xHotspot: 0,
-        yHotspot: 0,
-        hbmMask: mask,
-        hbmColor: color,
-    };
-    let icon = unsafe { CreateIconIndirect(&icon_info) };
-
-    // CreateIconIndirect copies both bitmaps, so ours are ours to free
-    // either way.
+fn load_icon_resource(id: u16, width: i32, height: i32) -> windows::core::Result<HICON> {
     unsafe {
-        let _ = DeleteObject(color.into());
-        let _ = DeleteObject(mask.into());
+        let instance: HINSTANCE = GetModuleHandleW(None)?.into();
+        let image = LoadImageW(
+            Some(instance),
+            PCWSTR(id as usize as *const u16),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_DEFAULTCOLOR,
+        )?;
+        Ok(HICON(image.0))
     }
-
-    match icon {
-        Ok(icon) => Some(icon),
-        Err(e) => {
-            log::warn!("windows_tray: CreateIconIndirect failed: {e}");
-            None
-        }
-    }
-}
-
-/// An all-zero 1-bpp mask bitmap: "no pixel is masked out".
-///
-/// 1-bpp DDB scanlines are WORD-aligned, hence the rounding up to
-/// whole 16-pixel groups.
-unsafe fn create_blank_mask(width: i32, height: i32) -> Option<HBITMAP> {
-    let stride = ((width as usize).div_ceil(16)) * 2;
-    let zeros = vec![0u8; stride * height as usize];
-    let mask = unsafe { CreateBitmap(width, height, 1, 1, Some(zeros.as_ptr().cast())) };
-    if mask.is_invalid() {
-        log::warn!("windows_tray: CreateBitmap for the icon mask failed");
-        return None;
-    }
-    Some(mask)
 }
