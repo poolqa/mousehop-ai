@@ -36,7 +36,41 @@ receiver bounds the
 encrypted length before allocation, streams chunks to a fresh temporary
 directory, requires contiguous offsets, and verifies SHA-256 before making an
 item complete. The source waits for a completion acknowledgement before
-considering the copy delivered.
+considering the copy delivered. The bulk acknowledgement confirms validated
+staging; Windows desktop publication is confirmed separately by the helper.
+The local desktop-helper pipe uses v2 frames with publication IDs and revision-tagged
+clipboard reports. Pending publications retain their staging leases until applied
+or rejected; stale reports cannot release newer files. Captured file lists inherit
+the lease so forwarding remains valid after the local clipboard changes. File identity
+and capture signatures share `input_event::windows_clipboard_path_key` so the native
+clipboard's removed verbatim prefix, separator changes, or ASCII casing do not
+release the lease or rebroadcast an already received file. Clipboard
+monitor snapshots queued before remote publication are discarded. Bulk copies made
+before the outbound handshake retain the latest item per enabled peer for up to
+15 seconds while dialing, then check negotiated capabilities before sending.
+On macOS the change-count gate is per monitor. A change postponed by the 200 ms
+debounce window is retried until processed, even if the pasteboard does not change
+again; otherwise a new file copy could remain invisible until the next copy or
+daemon restart. Desktop publication logs identify text, image, or file-list content
+without logging text contents.
+When a native file list is unavailable in the installed Windows SYSTEM helper,
+it starts the same installed executable as `windows-clipboard-read` with the
+login user's primary token on `winsta0\\default`. Elevated user tokens use their
+limited linked token. The reader initializes an OLE apartment and requests
+CF_HDROP from the clipboard's IDataObject, matching Explorer's file-copy model.
+The one-shot reader runs before console attachment, GUI, config or service
+initialization. Only stdout and NUL handles are inherited via an explicit handle
+list. Its bounded JSON response (1 MiB, 4096 absolute paths) is delivered over an
+anonymous pipe. A job kills it on failure or timeout, and the helper accepts and
+caches only snapshots matching the native clipboard sequence throughout the
+read. It never applies clipboard data or opens a network/service listener.
+If a file format or the user read fails, polling retries rather than publishing
+a text fallback.
+User-reader snapshots are logged at debug level without clipboard contents.
+A desktop report arriving before the network service subscribes is buffered (latest only)
+and delivered upon subscription; remote publication or desktop replacement
+invalidates that buffer.
+
 
 `input-capture::clipboard` queries the OS clipboard in file-list, bitmap, then
 text order. This preserves native file copies that also expose a URI-list text
@@ -219,7 +253,7 @@ lock/unlock and UAC transitions retain the existing DTLS sessions and input
 ownership. An inaccessible desktop causes an input gap, not a network restart.
 A console-session change or network-process failure still requires reconnecting.
 
-The per-session `Mousehop.Desktop.v1` named pipe admits SYSTEM only, rejects
+The per-session `Mousehop.Desktop.v2` named pipe admits SYSTEM only, rejects
 remote clients, and verifies both endpoint identities. Each helper connection has
 a generation: stale capture, clipboard and completion messages are discarded.
 Capture-edge configuration is replayed to a new helper; input events are never
@@ -347,6 +381,17 @@ Windows runtime acceptance (requires a Windows 10/11 x64 machine and a paired pe
    check the PID/path confirmation; declining must leave it running. In silent
    mode a port conflict must fail with those details and no confirmation dialog.
    Confirm installation succeeds when PowerShell is disabled by machine policy.
+8. In the logged-in user's Explorer, copy a local file and paste it in the peer's
+   file manager. Repeat in reverse, then copy a different Windows source file
+   immediately after receiving a remote file. Confirm the source copy replaces
+   the received clipboard, the service logs a changed file list, and both pasted
+   files have the expected contents. Repeat after switching console users. A
+   failed FileDrop read must log a retry and must not publish a text fallback.
+   In installed service mode, enable debug logging and verify Explorer copies
+   produce `Desktop user clipboard snapshot: ... files=1` and reach the peer.
+   Copy a Chinese-named CSV, a second file, plain text, and
+   clear the clipboard; verify the reader does not repeat idle launches, expose
+   a console, or leave child processes behind after stop/UAC/lock transitions.
 
 Automated checks: `cargo test -p mousehop-ipc -p mousehop --lib`,
 `cargo clippy --workspace --all-targets --all-features`, and a Windows-target

@@ -661,7 +661,6 @@ pub async fn desktop_worker(mut config: crate::config::Config) -> io::Result<()>
     use futures::StreamExt;
     use input_capture::{CaptureEvent, HostInputState, InputCapture, clipboard::ClipboardMonitor};
     use input_emulation::InputEmulation;
-    use input_event::Event;
     use mousehop_ipc::desktop::{self, Capture, Input, Request, Response};
     use tokio::{net::windows::named_pipe::ClientOptions, sync::mpsc};
     require_system()?;
@@ -724,6 +723,12 @@ pub async fn desktop_worker(mut config: crate::config::Config) -> io::Result<()>
         }
         Ok::<(), io::Error>(())
     });
+    let clipboard_sink = if secure {
+        None
+    } else {
+        Some(input_emulation::clipboard::ClipboardEmulation::new().map_err(io::Error::other)?)
+    };
+    let mut clipboard_revision = 0;
     let mut geometry = tokio::time::interval(Duration::from_secs(2));
     let result = async {
         loop {
@@ -748,10 +753,22 @@ pub async fn desktop_worker(mut config: crate::config::Config) -> io::Result<()>
                             let ok = emulation.warp_cursor(x,y).await.is_ok();
                             tx.send(Response::Complete {id,ok}).await.map_err(io::Error::other)?;
                         },
-                        Request::Clipboard(clipboard) => if !secure {
+                        Request::Clipboard { id, clipboard } => {
                             let event = clipboard.into_event();
-                            if let Some(monitor) = &monitor { monitor.update_last_event(&event); }
-                            emulation.consume(Event::Clipboard(event),0).await.map_err(io::Error::other)?;
+                            let ok = if let Some(sink) = &clipboard_sink {
+                                match sink.set(event.clone()).await {
+                                    Ok(()) => {
+                                        if let Some(monitor) = &monitor { monitor.update_last_event(&event); }
+                                        true
+                                    }
+                                    Err(error) => {
+                                        log::warn!("Desktop clipboard publication {id} failed: {error}");
+                                        false
+                                    }
+                                }
+                            } else { false };
+                            clipboard_revision = id;
+                            tx.send(Response::ClipboardApplied { id, ok }).await.map_err(io::Error::other)?;
                         },
                     }
                 },
@@ -767,7 +784,7 @@ pub async fn desktop_worker(mut config: crate::config::Config) -> io::Result<()>
                     tx.send(Response::Capture {edge:handle as u8,event}).await.map_err(io::Error::other)?;
                 },
                 event = helper_clipboard(&mut monitor) => {
-                    tx.send(Response::Clipboard(desktop::Clipboard::from_event(&event))).await.map_err(io::Error::other)?;
+                    tx.send(Response::Clipboard { revision: clipboard_revision, clipboard: desktop::Clipboard::from_event(&event) }).await.map_err(io::Error::other)?;
                 },
                 _ = geometry.tick() => { tx.send(Response::Geometry(emulation.display_bounds())).await.map_err(io::Error::other)?; },
                 _ = config.changed() => {

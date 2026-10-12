@@ -3,7 +3,10 @@ use input_event::{ClipboardEvent, Event};
 use mousehop_ipc::AppIdent;
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::spawn_blocking;
@@ -11,6 +14,17 @@ use tokio::time::interval;
 
 use crate::frontmost_app;
 use crate::{CaptureError, CaptureEvent};
+
+#[cfg(any(windows, test))]
+pub(crate) mod windows_snapshot;
+
+/// Internal entry point for the installed Windows user's one-shot file reader.
+/// It writes a bounded JSON snapshot to the inherited stdout pipe, then exits.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn write_windows_clipboard_snapshot() -> std::io::Result<()> {
+    crate::windows::clipboard_reader::write_snapshot()
+}
 
 /// Shared, mutable suppression list. Service owns the canonical
 /// `Arc<Mutex<HashSet<AppIdent>>>` and clones the handle into each
@@ -21,11 +35,12 @@ pub type SuppressionList = Arc<Mutex<HashSet<AppIdent>>>;
 
 /// Clipboard monitor that watches for clipboard changes
 pub struct ClipboardMonitor {
-    event_rx: Receiver<CaptureEvent>,
-    _event_tx: Sender<CaptureEvent>,
+    event_rx: Receiver<(u64, CaptureEvent)>,
+    _event_tx: Sender<(u64, CaptureEvent)>,
     last_content: Arc<Mutex<Option<u64>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl ClipboardMonitor {
@@ -47,6 +62,8 @@ impl ClipboardMonitor {
         let last_content: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
+        let revision = Arc::new(AtomicU64::new(0));
+        let poll_revision = revision.clone();
 
         let last_content_clone = last_content.clone();
         let last_change_clone = last_change.clone();
@@ -55,7 +72,7 @@ impl ClipboardMonitor {
         let suppression_clone = suppression.clone();
 
         // Spawn monitoring task. Cadence: 100 ms on macOS (cheap
-        // because `pasteboard_change_count_advanced` short-circuits
+        // because the pasteboard change-count gate short-circuits
         // 99% of ticks via a single integer compare); 500 ms
         // elsewhere (no cheap precheck, full content read every
         // tick). Tighter cadence on macOS shrinks the
@@ -69,6 +86,8 @@ impl ClipboardMonitor {
 
         tokio::spawn(async move {
             let mut check_interval = interval(Duration::from_millis(POLL_MS));
+            #[cfg(target_os = "macos")]
+            let mut pasteboard_gate = PasteboardPollGate::default();
 
             loop {
                 check_interval.tick().await;
@@ -89,7 +108,7 @@ impl ClipboardMonitor {
                 // monitor optimization (Maccy / Alfred / Paste all
                 // do it). Single integer compare per idle tick.
                 #[cfg(target_os = "macos")]
-                if !pasteboard_change_count_advanced() {
+                if !pasteboard_gate.should_read(pasteboard_change_count()) {
                     continue;
                 }
 
@@ -99,25 +118,30 @@ impl ClipboardMonitor {
                 let event_tx_clone2 = event_tx_clone.clone();
                 let suppression_clone2 = suppression_clone.clone();
 
-                let _ = spawn_blocking(move || {
+                let revision_clone = poll_revision.clone();
+                let observed_revision = revision_clone.load(Ordering::SeqCst);
+                let read_result = spawn_blocking(move || {
                     // Create clipboard instance
                     let mut clipboard = match Clipboard::new() {
                         Ok(c) => c,
                         Err(e) => {
                             log::debug!("Failed to create clipboard: {e}");
-                            return;
+                            return false;
                         }
                     };
 
                     let current = match read_clipboard_event(&mut clipboard) {
                         Some(event) => event,
-                        None => return,
+                        None => return false,
                     };
                     let signature = clipboard_signature(&current);
 
                     // Check if content changed
                     let mut last_content = last_content_clone2.lock().unwrap();
                     let mut last_change = last_change_clone2.lock().unwrap();
+                    if revision_clone.load(Ordering::SeqCst) != observed_revision {
+                        return true;
+                    }
 
                     let last_change_elapsed = last_change.map(|t| t.elapsed());
                     // App-source suppression. Frontmost-app lookup
@@ -200,11 +224,18 @@ impl ClipboardMonitor {
                                 ),
                             }
                             let event = CaptureEvent::Input(Event::Clipboard(current));
-                            let _ = event_tx_clone2.blocking_send(event);
+                            let _ = event_tx_clone2.blocking_send((observed_revision, event));
                         }
                     }
+                    decision == PollDecision::Debounced
                 })
                 .await;
+                #[cfg(target_os = "macos")]
+                {
+                    pasteboard_gate.retry = read_result.unwrap_or(false);
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = read_result;
             }
         });
 
@@ -214,12 +245,18 @@ impl ClipboardMonitor {
             last_content,
             last_change,
             enabled,
+            revision,
         })
     }
 
     /// Receive the next clipboard event
     pub async fn recv(&mut self) -> Option<CaptureEvent> {
-        self.event_rx.recv().await
+        while let Some((revision, event)) = self.event_rx.recv().await {
+            if revision == self.revision.load(Ordering::SeqCst) {
+                return Some(event);
+            }
+        }
+        None
     }
 
     /// Enable clipboard monitoring
@@ -241,6 +278,8 @@ impl ClipboardMonitor {
     pub fn update_last_event(&self, event: &ClipboardEvent) {
         let mut last_content = self.last_content.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
+        // Invalidate reads and queued events from before remote publication.
+        self.revision.fetch_add(1, Ordering::SeqCst);
         *last_content = Some(clipboard_signature(event));
         *last_change = Some(Instant::now());
     }
@@ -260,6 +299,43 @@ fn read_clipboard_event(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
                 paths,
                 owned_root: None,
             });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::AtomicU32;
+        use windows::Win32::System::DataExchange::{
+            GetClipboardSequenceNumber, IsClipboardFormatAvailable,
+        };
+        // Read Explorer's OLE files in the user's process. An advertised file
+        // list that cannot yet be read must not fall back to its text form.
+        let files = crate::windows::clipboard_reader::read_as_desktop_user().and_then(|paths| {
+            if paths.is_empty() && unsafe { IsClipboardFormatAvailable(15) }.is_ok() {
+                Err(std::io::Error::other(
+                    "FileDrop is available but could not be read",
+                ))
+            } else {
+                Ok(paths)
+            }
+        });
+        match files {
+            Ok(paths) if !paths.is_empty() => {
+                return Some(ClipboardEvent::Files {
+                    paths,
+                    owned_root: None,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                static LAST_FAILED_READ: AtomicU32 = AtomicU32::new(u32::MAX);
+                let sequence = unsafe { GetClipboardSequenceNumber() };
+                if LAST_FAILED_READ.swap(sequence, Ordering::Relaxed) != sequence {
+                    log::warn!(
+                        "Clipboard file read failed (sequence {sequence}); retrying: {error}"
+                    );
+                }
+                return None;
+            }
         }
     }
     if let Ok(image) = clipboard.get_image() {
@@ -299,6 +375,9 @@ pub fn clipboard_signature(event: &ClipboardEvent) -> u64 {
         ClipboardEvent::Files { paths, .. } => {
             2_u8.hash(&mut hasher);
             for path in paths {
+                #[cfg(windows)]
+                input_event::windows_clipboard_path_key(path).hash(&mut hasher);
+                #[cfg(not(windows))]
                 path.hash(&mut hasher);
                 if let Ok(metadata) = std::fs::metadata(path) {
                     metadata.len().hash(&mut hasher);
@@ -358,31 +437,33 @@ fn is_suppressed(list: &SuppressionList) -> Option<AppIdent> {
     snapshot.into_iter().find(|s| s.matches(&active))
 }
 
-/// Returns `true` the first time it's called, and on every later
-/// call where `NSPasteboard.generalPasteboard.changeCount` has
-/// advanced since the previous call. Used as a cheap precheck so
-/// the polling loop only invokes `arboard::Clipboard::get_text`
-/// (which round-trips through `pboardd` via XPC) on ticks where
-/// the pasteboard actually mutated.
+/// Cheap native version query for the per-monitor polling gate.
 ///
 /// `changeCount` reads are an Apple-blessed background-thread
 /// operation — the property is designed for exactly this kind of
 /// polling. No autorelease pool needed: the return value is a
 /// primitive `NSInteger`, not an Objective-C object.
 #[cfg(target_os = "macos")]
-fn pasteboard_change_count_advanced() -> bool {
+fn pasteboard_change_count() -> i64 {
     use objc2_app_kit::NSPasteboard;
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    // Initial sentinel `i64::MIN` ensures the first call always
-    // returns `true` so we read once at startup to seed the
-    // diff-against-`last_content` machinery downstream.
-    static LAST: AtomicI64 = AtomicI64::new(i64::MIN);
-
     let pb = NSPasteboard::generalPasteboard();
-    let now = pb.changeCount() as i64;
-    let prev = LAST.swap(now, Ordering::Relaxed);
-    prev != now
+    pb.changeCount() as i64
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct PasteboardPollGate {
+    last_count: Option<i64>,
+    retry: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl PasteboardPollGate {
+    fn should_read(&mut self, count: i64) -> bool {
+        // A debounced copy still needs processing after 200 ms, even when
+        // NSPasteboard does not change again. Track this per monitor.
+        self.last_count.replace(count) != Some(count) || self.retry
+    }
 }
 
 /// Outcome of a single clipboard-poll cycle. Pulled into a pure
@@ -455,6 +536,86 @@ impl PollDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debounced_file_copy_is_retried_without_another_pasteboard_change() {
+        let mut gate = PasteboardPollGate::default();
+        assert!(gate.should_read(10));
+        assert!(!gate.should_read(10));
+        assert!(gate.should_read(11));
+        let decision = PollDecision::classify(true, Some(Duration::from_millis(100)), false, false);
+        gate.retry = decision == PollDecision::Debounced;
+        assert!(
+            gate.should_read(11),
+            "latest copy must survive the debounce window"
+        );
+        let decision = PollDecision::classify(true, Some(Duration::from_millis(300)), false, false);
+        assert_eq!(decision, PollDecision::Emit);
+        gate.retry = decision == PollDecision::Debounced;
+        assert!(!gate.should_read(11));
+    }
+
+    #[test]
+    fn pasteboard_read_gate_is_independent_for_each_monitor() {
+        let mut first = PasteboardPollGate::default();
+        let mut second = PasteboardPollGate::default();
+        assert!(first.should_read(42));
+        assert!(second.should_read(42));
+        assert!(!first.should_read(42));
+        assert!(!second.should_read(42));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_file_path_normalization_does_not_emit_remote_copy_again() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let canonical = std::fs::canonicalize(file.path()).unwrap();
+        let native = canonical
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase();
+        let received = ClipboardEvent::Files {
+            paths: vec![canonical],
+            owned_root: None,
+        };
+        let read_back = ClipboardEvent::Files {
+            paths: vec![std::path::PathBuf::from(native)],
+            owned_root: None,
+        };
+        assert_eq!(
+            clipboard_signature(&received),
+            clipboard_signature(&read_back)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_publication_discards_queued_local_snapshot() {
+        let (tx, rx) = mpsc::channel(4);
+        let mut monitor = ClipboardMonitor {
+            event_rx: rx,
+            _event_tx: tx.clone(),
+            last_content: Arc::new(Mutex::new(None)),
+            last_change: Arc::new(Mutex::new(None)),
+            enabled: Arc::new(Mutex::new(true)),
+            revision: Arc::new(AtomicU64::new(0)),
+        };
+        tx.send((
+            0,
+            CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text("stale".into()))),
+        ))
+        .await
+        .unwrap();
+        monitor.update_last_event(&ClipboardEvent::Text("remote".into()));
+        tx.send((
+            1,
+            CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text("new local".into()))),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            matches!(monitor.recv().await, Some(CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text(s)))) if s == "new local")
+        );
+    }
 
     #[test]
     fn classify_unchanged_when_text_matches_last_content() {

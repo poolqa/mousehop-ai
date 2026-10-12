@@ -11,6 +11,7 @@ use input_event::CrossingModifier;
 
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
+pub(crate) mod clipboard_reader;
 mod display_util;
 mod event_thread;
 

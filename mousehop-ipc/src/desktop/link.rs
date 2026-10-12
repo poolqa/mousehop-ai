@@ -28,7 +28,25 @@ pub fn initialize() -> Arc<Link> {
     LINK.get_or_init(|| Arc::new(Link::default())).clone()
 }
 pub fn pipe_name(session: u32) -> String {
-    format!(r"\\.\pipe\Mousehop.Desktop.v1.{session}")
+    format!(r"\\.\pipe\Mousehop.Desktop.v2.{session}")
+}
+
+fn clipboard_matches_event(clipboard: &Clipboard, event: &ClipboardEvent) -> bool {
+    match (clipboard, event) {
+        (
+            Clipboard::Files(actual),
+            ClipboardEvent::Files {
+                paths: expected, ..
+            },
+        ) => {
+            actual.len() == expected.len()
+                && actual.iter().zip(expected).all(|(a, b)| {
+                    input_event::windows_clipboard_path_key(a)
+                        == input_event::windows_clipboard_path_key(b)
+                })
+        }
+        _ => Clipboard::from_event(event) == *clipboard,
+    }
 }
 
 #[derive(Default)]
@@ -40,11 +58,17 @@ struct State {
     captures: HashMap<u8, Option<CrossingModifier>>,
     capture_tx: Option<mpsc::Sender<(u64, u8, Capture)>>,
     clipboard_tx: Option<mpsc::Sender<(u64, ClipboardEvent)>>,
+    // The desktop helper may publish before Service::new installs its receiver.
+    startup_clipboard: Option<(u64, ClipboardEvent)>,
     bounds: Option<(u32, u32)>,
     serial: u64,
     replies: HashMap<u64, oneshot::Sender<bool>>,
     // Keep downloaded file trees alive while the helper's clipboard references them.
     clipboard_lease: Option<ClipboardEvent>,
+    clipboard_revision: u64,
+    pending_clipboards: HashMap<u64, ClipboardEvent>,
+    // A helper may have applied a publication before its acknowledgement was lost.
+    unconfirmed_clipboards: Vec<ClipboardEvent>,
     pending_releases: Vec<u32>,
 }
 #[derive(Default)]
@@ -72,7 +96,12 @@ impl Link {
     }
     pub fn subscribe_clipboard(&self) -> mpsc::Receiver<(u64, ClipboardEvent)> {
         let (tx, rx) = mpsc::channel(8);
-        self.state.lock().unwrap().clipboard_tx = Some(tx);
+        let mut s = self.state.lock().unwrap();
+        if let Some(report) = s.startup_clipboard.take() {
+            let _ = tx.try_send(report);
+            log::debug!("Replaying buffered desktop clipboard report to network service");
+        }
+        s.clipboard_tx = Some(tx);
         rx
     }
     pub fn suspend(&self) {
@@ -82,6 +111,10 @@ impl Link {
         s.ready = false;
         s.secure = true;
         s.replies.clear();
+        let pending = std::mem::take(&mut s.pending_clipboards);
+        s.unconfirmed_clipboards.extend(pending.into_values());
+        s.clipboard_revision = 0;
+        s.startup_clipboard = None;
         if let Some(tx) = s.capture_tx.as_ref() {
             for &edge in s.captures.keys() {
                 let _ = tx.try_send((s.generation, edge, Capture::AutoRelease));
@@ -129,12 +162,21 @@ impl Link {
     pub fn clipboard(&self, event: ClipboardEvent) {
         let mut s = self.state.lock().unwrap();
         if s.ready && !s.secure {
-            if let Some(tx) = s.sender.as_ref() {
-                if tx
-                    .try_send(Request::Clipboard(Clipboard::from_event(&event)))
-                    .is_ok()
-                {
-                    s.clipboard_lease = Some(event);
+            if let Some(tx) = s.sender.clone() {
+                s.serial += 1;
+                let id = s.serial;
+                let request = Request::Clipboard {
+                    id,
+                    clipboard: Clipboard::from_event(&event),
+                };
+                if tx.try_send(request).is_ok() {
+                    s.startup_clipboard = None;
+                    // Keep both the current clipboard and queued publications alive
+                    // until the helper reports whether each publication succeeded.
+                    s.clipboard_revision = id;
+                    s.pending_clipboards.insert(id, event);
+                } else {
+                    log::warn!("Desktop helper command queue unavailable; dropping clipboard");
                 }
             }
         }
@@ -204,16 +246,61 @@ impl Link {
                     let _ = tx.try_send((generation, edge, event));
                 }
             }
-            Response::Clipboard(c) => {
-                if !s.secure {
-                    if s.clipboard_lease
-                        .as_ref()
-                        .is_some_and(|lease| Clipboard::from_event(lease) != c)
+            Response::Clipboard {
+                revision,
+                clipboard,
+            } => {
+                if !s.secure && revision == s.clipboard_revision {
+                    let retained = s
+                        .clipboard_lease
+                        .iter()
+                        .chain(s.unconfirmed_clipboards.iter())
+                        .find(|lease| clipboard_matches_event(&clipboard, lease))
+                        .cloned();
+                    if retained.is_none()
+                        && s.clipboard_lease
+                            .as_ref()
+                            .is_some_and(|event| matches!(event, ClipboardEvent::Files { .. }))
                     {
-                        s.clipboard_lease = None;
+                        log::debug!(
+                            "Desktop clipboard changed; releasing staging lease (expected {:?}, actual {:?})",
+                            s.clipboard_lease.as_ref().map(Clipboard::from_event),
+                            clipboard
+                        );
                     }
+                    s.unconfirmed_clipboards.clear();
+                    s.clipboard_lease = retained.clone();
+                    let event = retained.unwrap_or_else(|| clipboard.into_event());
                     if let Some(tx) = s.clipboard_tx.as_ref() {
-                        let _ = tx.try_send((generation, c.into_event()));
+                        // Forwarding must retain the same staging lease as the clipboard.
+                        let _ = tx.try_send((generation, event));
+                    } else {
+                        s.startup_clipboard = Some((generation, event));
+                        log::debug!(
+                            "Buffering desktop clipboard report until network service subscribes"
+                        );
+                    }
+                }
+            }
+            Response::ClipboardApplied { id, ok } => {
+                if let Some(event) = s.pending_clipboards.remove(&id) {
+                    if ok {
+                        match &event {
+                            ClipboardEvent::Files { paths, .. } => log::debug!(
+                                "Desktop helper applied clipboard publication {id}: files, {} item(s)",
+                                paths.len()
+                            ),
+                            ClipboardEvent::ImageRgba { width, height, .. } => log::debug!(
+                                "Desktop helper applied clipboard publication {id}: image {width}x{height}"
+                            ),
+                            ClipboardEvent::Text(text) => log::debug!(
+                                "Desktop helper applied clipboard publication {id}: text, {} bytes",
+                                text.len()
+                            ),
+                        }
+                        s.clipboard_lease = Some(event);
+                    } else {
+                        log::warn!("Desktop helper failed to apply clipboard publication {id}");
                     }
                 }
             }
@@ -315,6 +402,268 @@ async fn serve_connection(
 mod tests {
     use super::*;
     #[test]
+    fn startup_clipboard_report_reaches_late_subscriber() {
+        let link = Link::default();
+        let (tx, _requests) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        let files = vec![std::path::PathBuf::from(r"C:\Users\admin\test.txt")];
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Files(files.clone()),
+            },
+        );
+        let mut captured = link.subscribe_clipboard();
+        assert!(
+            matches!(captured.try_recv().unwrap(), (0, ClipboardEvent::Files { paths, .. }) if paths == files)
+        );
+        assert!(captured.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_clipboard_buffer_keeps_latest_and_drops_on_desktop_change() {
+        let link = Link::default();
+        let (tx, _requests) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        for text in ["old", "new"] {
+            link.response(
+                0,
+                Response::Clipboard {
+                    revision: 0,
+                    clipboard: Clipboard::Text(text.into()),
+                },
+            );
+        }
+        let mut captured = link.subscribe_clipboard();
+        assert!(matches!(captured.try_recv().unwrap(), (0, ClipboardEvent::Text(s)) if s == "new"));
+        assert!(captured.try_recv().is_err());
+        let link = Link::default();
+        let (tx, _requests) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("old desktop".into()),
+            },
+        );
+        link.suspend();
+        assert!(link.subscribe_clipboard().try_recv().is_err());
+    }
+
+    #[test]
+    fn remote_publication_supersedes_buffered_startup_clipboard() {
+        let link = Link::default();
+        let (tx, _requests) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("local before startup".into()),
+            },
+        );
+        link.clipboard(ClipboardEvent::Text("remote".into()));
+        assert!(link.subscribe_clipboard().try_recv().is_err());
+    }
+
+    fn staged_file() -> (std::path::PathBuf, ClipboardEvent) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "mousehop-lease-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("test.txt");
+        std::fs::write(&file, b"received file").unwrap();
+        let event = ClipboardEvent::Files {
+            paths: vec![file],
+            owned_root: Some(input_event::ClipboardFileLease::new(root.clone())),
+        };
+        (root, event)
+    }
+
+    #[test]
+    fn native_path_matching_handles_unc_and_preserves_distinct_files() {
+        assert_eq!(
+            input_event::windows_clipboard_path_key(std::path::Path::new(
+                r"\\?\UNC\SERVER\Share\file.txt"
+            )),
+            input_event::windows_clipboard_path_key(std::path::Path::new(
+                r"\\server\share\file.txt"
+            ))
+        );
+        assert_eq!(
+            input_event::windows_clipboard_path_key(std::path::Path::new(
+                "C:/Windows/Temp/file.txt"
+            )),
+            input_event::windows_clipboard_path_key(std::path::Path::new(
+                r"c:\windows\temp\file.txt"
+            ))
+        );
+        assert_ne!(
+            input_event::windows_clipboard_path_key(std::path::Path::new(r"C:\Temp\one.txt")),
+            input_event::windows_clipboard_path_key(std::path::Path::new(r"C:\Temp\two.txt"))
+        );
+        assert_ne!(
+            input_event::windows_clipboard_path_key(std::path::Path::new(r"C:\Temp\一.txt")),
+            input_event::windows_clipboard_path_key(std::path::Path::new(r"C:\Temp\二.txt"))
+        );
+    }
+
+    #[test]
+    fn normalized_native_file_report_retains_staging() {
+        let link = Link::default();
+        let mut captured = link.subscribe_clipboard();
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        let (root, mut event) = staged_file();
+        // arboard publishes GetFinalPathNameByHandleW paths and strips \?\.
+        let ClipboardEvent::Files { paths, .. } = &mut event else {
+            unreachable!()
+        };
+        *paths = vec![std::path::PathBuf::from(r"\\?\C:\WINDOWS\Temp\test.txt")];
+        let native = Clipboard::Files(vec![std::path::PathBuf::from(r"C:\Windows\Temp\test.txt")]);
+        link.clipboard(event);
+        let Request::Clipboard { id, .. } = rx.try_recv().unwrap() else {
+            panic!("publication")
+        };
+        link.response(0, Response::ClipboardApplied { id, ok: true });
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: id,
+                clipboard: native,
+            },
+        );
+        assert!(
+            root.join("test.txt").exists(),
+            "native path normalization must not release staging"
+        );
+        let (_, event) = captured.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            ClipboardEvent::Files {
+                owned_root: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_clipboard_report_cannot_delete_pending_publication() {
+        let link = Link::default();
+        let mut captured = link.subscribe_clipboard();
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        let (root, event) = staged_file();
+        link.clipboard(event);
+        let Request::Clipboard { id, clipboard } = rx.try_recv().unwrap() else {
+            panic!("publication")
+        };
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("old".into()),
+            },
+        );
+        assert!(root.join("test.txt").exists());
+        assert!(captured.try_recv().is_err());
+        link.response(0, Response::ClipboardApplied { id, ok: true });
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: id,
+                clipboard,
+            },
+        );
+        let (_, forwarded) = captured.try_recv().unwrap();
+        assert!(matches!(
+            &forwarded,
+            ClipboardEvent::Files {
+                owned_root: Some(_),
+                ..
+            }
+        ));
+        // Replacing the clipboard must not remove files still being forwarded.
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: id,
+                clipboard: Clipboard::Text("new".into()),
+            },
+        );
+        assert!(root.exists());
+        drop(forwarded);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn failed_publication_preserves_previous_clipboard_files() {
+        let link = Link::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        let (old_root, old_event) = staged_file();
+        link.clipboard(old_event);
+        let Request::Clipboard { id, .. } = rx.try_recv().unwrap() else {
+            panic!("publication")
+        };
+        link.response(0, Response::ClipboardApplied { id, ok: true });
+        let (new_root, new_event) = staged_file();
+        link.clipboard(new_event);
+        let Request::Clipboard { id, .. } = rx.try_recv().unwrap() else {
+            panic!("publication")
+        };
+        assert!(old_root.exists() && new_root.exists());
+        link.response(0, Response::ClipboardApplied { id, ok: false });
+        assert!(old_root.exists());
+        assert!(!new_root.exists());
+        drop(link);
+        assert!(!old_root.exists());
+    }
+
+    #[test]
+    fn desktop_replacement_retains_unconfirmed_files_until_current_report() {
+        let link = Link::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(link.attach(0, false, None, tx));
+        let (root, event) = staged_file();
+        link.clipboard(event);
+        let Request::Clipboard { id, clipboard } = rx.try_recv().unwrap() else {
+            panic!("publication")
+        };
+        link.suspend();
+        assert!(root.exists());
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(link.attach(1, false, None, tx));
+        link.response(0, Response::ClipboardApplied { id, ok: true });
+        assert!(link.state.lock().unwrap().clipboard_lease.is_none());
+        link.response(
+            1,
+            Response::Clipboard {
+                revision: 0,
+                clipboard,
+            },
+        );
+        assert!(root.exists());
+        link.response(
+            1,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("new".into()),
+            },
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn replaced_helper_cannot_publish_or_replay_old_input() {
         let link = Link::default();
         let (tx, mut rx) = mpsc::channel(8);
@@ -374,14 +723,32 @@ mod tests {
         let mut clipboard = link.subscribe_clipboard();
         let (tx, _) = mpsc::channel(16);
         assert!(link.attach(0, true, None, tx));
-        link.response(0, Response::Clipboard(Clipboard::Text("secret".into())));
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("secret".into()),
+            },
+        );
         assert!(clipboard.try_recv().is_err());
         link.suspend();
         let (tx, _) = mpsc::channel(16);
         assert!(link.attach(1, false, None, tx));
-        link.response(0, Response::Clipboard(Clipboard::Text("stale".into())));
+        link.response(
+            0,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("stale".into()),
+            },
+        );
         assert!(clipboard.try_recv().is_err());
-        link.response(1, Response::Clipboard(Clipboard::Text("current".into())));
+        link.response(
+            1,
+            Response::Clipboard {
+                revision: 0,
+                clipboard: Clipboard::Text("current".into()),
+            },
+        );
         assert!(
             matches!(clipboard.try_recv().unwrap(), (1,ClipboardEvent::Text(s)) if s == "current")
         );

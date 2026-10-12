@@ -99,6 +99,31 @@ pub enum ClipboardEvent {
     },
 }
 
+/// Comparison key for Windows clipboard paths: removes DOS/UNC verbatim prefixes,
+/// normalizes separators and ASCII casing, and preserves non-ASCII path bytes.
+/// Use only for native clipboard identity, never to construct filesystem paths.
+pub fn windows_clipboard_path_key(path: &Path) -> Vec<u8> {
+    let key: Vec<u8> = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|&byte| {
+            if byte == b'/' {
+                b'\\'
+            } else {
+                byte.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    if let Some(unc) = key.strip_prefix(br"\\?\unc\") {
+        [br"\\".as_slice(), unc].concat()
+    } else if let Some(dos) = key.strip_prefix(br"\\?\") {
+        dos.to_vec()
+    } else {
+        key
+    }
+}
+
 /// Shared lifetime token for a received clipboard file tree. The staging
 /// directory is reclaimed only after the clipboard sink, forwarding tasks,
 /// and all event clones have released it.

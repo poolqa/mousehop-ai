@@ -69,6 +69,28 @@ pub enum ServiceError {
     Certificate(#[from] crypto::Error),
 }
 
+type DeferredClipboard = (ClipboardEvent, String, Instant);
+
+fn take_ready_clipboards(
+    pending: &mut HashMap<ClientHandle, DeferredClipboard>,
+    enabled: &HashSet<ClientHandle>,
+    is_ready: impl Fn(ClientHandle) -> bool,
+) -> Vec<(ClientHandle, DeferredClipboard)> {
+    let mut ready = Vec::new();
+    pending.retain(|handle, (_, _, queued)| {
+        if !enabled.contains(handle) || queued.elapsed() >= Duration::from_secs(15) {
+            log::debug!("discarding deferred clipboard for client {handle}: disabled or connection timed out");
+            return false;
+        }
+        if is_ready(*handle) { ready.push(*handle); }
+        true
+    });
+    ready
+        .into_iter()
+        .filter_map(|handle| pending.remove(&handle).map(|event| (handle, event)))
+        .collect()
+}
+
 pub struct Service {
     /// configuration
     config: Config,
@@ -146,6 +168,8 @@ pub struct Service {
     /// the duplicate. Pruned lazily — entries older than
     /// `RECENT_FORWARD_TTL` are dropped on each clipboard event.
     recent_forwarded: HashMap<(String, u64), Instant>,
+    // Latest clipboard per peer while its authenticated outbound session connects.
+    pending_clipboards: HashMap<ClientHandle, DeferredClipboard>,
     /// Shared with [`ClipboardMonitor`]; mutations to the inner
     /// `HashSet` take effect on the next clipboard poll without
     /// rebuilding the monitor.
@@ -376,6 +400,7 @@ impl Service {
             #[cfg(not(windows))]
             desktop_clipboard: None,
             recent_forwarded: HashMap::new(),
+            pending_clipboards: HashMap::new(),
             clipboard_suppression,
             fastest_streak: HashMap::new(),
         };
@@ -408,8 +433,10 @@ impl Service {
         // already published once at startup
         discovery_refresh_tick.tick().await;
 
+        let mut clipboard_retry = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
+                _ = clipboard_retry.tick(), if !self.pending_clipboards.is_empty() => self.retry_pending_clipboards().await,
                 request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
@@ -778,6 +805,7 @@ impl Service {
     }
 
     async fn handle_config_change(&mut self) {
+        self.pending_clipboards.clear();
         for h in self.client_manager.registered_clients() {
             self.remove_client(h).await;
         }
@@ -1051,21 +1079,29 @@ impl Service {
             ClipboardEvent::Files { .. } => CAP_CLIPBOARD_V2 | CAP_CLIPBOARD_FILES,
         };
         let needs_bulk = legacy.is_none();
-        let targets: Vec<_> = if needs_bulk {
-            targets
-                .into_iter()
-                .filter(|handle| {
-                    let capabilities = self.client_manager.peer_capabilities(*handle);
-                    let supported = capabilities & required_capability == required_capability;
-                    if !supported {
-                        log::warn!("client {handle} does not support this clipboard format");
-                    }
-                    supported
-                })
-                .collect()
-        } else {
-            targets
-        };
+        let mut ready_targets = Vec::new();
+        for handle in targets {
+            // A newer copy supersedes a deferred copy even if it is small text.
+            self.pending_clipboards.remove(&handle);
+            if needs_bulk && !self.client_manager.alive(handle) {
+                self.pending_clipboards.insert(
+                    handle,
+                    (event.clone(), from_fingerprint.clone(), Instant::now()),
+                );
+                // Trigger dialing before interpreting the default zero capabilities.
+                let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+                continue;
+            }
+            if needs_bulk
+                && self.client_manager.peer_capabilities(handle) & required_capability
+                    != required_capability
+            {
+                log::warn!("client {handle} does not support this clipboard format");
+                continue;
+            }
+            ready_targets.push(handle);
+        }
+        let targets = ready_targets;
         if targets.is_empty() {
             return;
         }
@@ -1144,6 +1180,23 @@ impl Service {
                     log::warn!("clipboard-v2 transfer to client {handle} failed: {error}");
                 }
             });
+        }
+    }
+
+    async fn retry_pending_clipboards(&mut self) {
+        let enabled: HashSet<_> = self
+            .client_manager
+            .clipboard_send_targets()
+            .into_iter()
+            .collect();
+        let ready = take_ready_clipboards(&mut self.pending_clipboards, &enabled, |handle| {
+            self.client_manager.alive(handle)
+        });
+        for (handle, (event, origin, _)) in ready {
+            self.fan_out_clipboard(event, origin, vec![handle]).await;
+        }
+        for &handle in self.pending_clipboards.keys() {
+            let _ = self.conn.send(ProtoEvent::Ping, handle).await;
         }
     }
 
@@ -1543,6 +1596,7 @@ impl Service {
     }
 
     async fn remove_client(&mut self, handle: ClientHandle) {
+        self.pending_clipboards.remove(&handle);
         // Retire the exact outbound DTLS generation before Slab can reuse this
         // numeric handle for a different configured peer. The remote side
         // releases its emulation handle on connection close, and Capture gets
@@ -1681,6 +1735,26 @@ async fn recv_desktop_clipboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_clipboard_waits_for_connection_and_honors_revocation_and_timeout() {
+        let item = || {
+            (
+                ClipboardEvent::Text("bulk copy".into()),
+                "origin".into(),
+                Instant::now(),
+            )
+        };
+        let mut pending = HashMap::from([(0, item()), (1, item()), (2, item())]);
+        pending.get_mut(&2).unwrap().2 = Instant::now() - Duration::from_secs(16);
+        let enabled = HashSet::from([0, 2]);
+        assert!(take_ready_clipboards(&mut pending, &enabled, |_| false).is_empty());
+        assert_eq!(pending.len(), 1);
+        let ready = take_ready_clipboards(&mut pending, &enabled, |_| true);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, 0);
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn clipboard_hash_is_deterministic_within_run() {

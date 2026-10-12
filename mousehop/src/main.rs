@@ -48,6 +48,19 @@ enum MousehopError {
 }
 
 fn main() {
+    // The user reader inherits a private stdout pipe. Route it before console
+    // attachment, logging, config loading or any GUI/service initialization.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("windows-clipboard-read") {
+        if std::env::args().len() != 2 {
+            process::exit(2);
+        }
+        if let Err(error) = input_capture::clipboard::write_windows_clipboard_snapshot() {
+            eprintln!("{error}");
+            process::exit(1);
+        }
+        return;
+    }
     // Windows only, and before anything can log or print: a
     // GUI-subsystem process starts with no standard handles, so hand
     // the console back to invocations that have something to say.

@@ -91,7 +91,7 @@ pub enum Request {
     Destroy(u64),
     ReleaseKeys(Vec<u32>),
     Warp { id: u64, x: i32, y: i32 },
-    Clipboard(Clipboard),
+    Clipboard { id: u64, clipboard: Clipboard },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -104,7 +104,14 @@ pub enum Response {
         edge: u8,
         event: Capture,
     },
-    Clipboard(Clipboard),
+    Clipboard {
+        revision: u64,
+        clipboard: Clipboard,
+    },
+    ClipboardApplied {
+        id: u64,
+        ok: bool,
+    },
     Complete {
         id: u64,
         ok: bool,
@@ -142,6 +149,50 @@ pub use link::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn clipboard_publication_and_revision_round_trip() {
+        let clipboard = Clipboard::Files(vec![PathBuf::from("test.txt")]);
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &Request::Clipboard {
+                id: 42,
+                clipboard: clipboard.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(read_frame::<_, Request>(&mut bytes.as_slice()).await.unwrap(), Request::Clipboard { id: 42, clipboard: value } if value == clipboard)
+        );
+        bytes.clear();
+        write_frame(
+            &mut bytes,
+            &Response::ClipboardApplied { id: 42, ok: false },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut bytes.as_slice())
+                .await
+                .unwrap(),
+            Response::ClipboardApplied { id: 42, ok: false }
+        ));
+        bytes.clear();
+        write_frame(
+            &mut bytes,
+            &Response::Clipboard {
+                revision: 42,
+                clipboard: clipboard.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(read_frame::<_, Response>(&mut bytes.as_slice()).await.unwrap(), Response::Clipboard { revision: 42, clipboard: value } if value == clipboard)
+        );
+    }
+
     #[tokio::test]
     async fn rejects_oversized_length_before_reading_payload() {
         let mut bytes = ((MAX_FRAME + 1) as u32).to_be_bytes().as_slice().to_vec();
