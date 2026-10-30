@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::connect::{ConnectionSession, MousehopConnection, MousehopConnectionEvent};
 
 pub(crate) struct Capture {
+    forwarding: Rc<Cell<bool>>,
     cancellation_token: CancellationToken,
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
@@ -31,6 +32,7 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
+    InputForwarding(bool),
     /// A capture barrier was entered. `handover` is true when a Default
     /// capture shares the edge, so the EnterOnly return will be followed by
     /// this device's own Enter + CursorPos rather than ending at a local
@@ -116,7 +118,9 @@ impl Capture {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
+        let forwarding = Rc::new(Cell::new(false));
         let capture_task = CaptureTask {
+            forwarding: forwarding.clone(),
             active_client: None,
             active_session: None,
             backend,
@@ -146,6 +150,7 @@ impl Capture {
         };
         let task = spawn_local(capture_task.run());
         Self {
+            forwarding,
             cancellation_token,
             request_tx,
             task,
@@ -197,6 +202,10 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::ReleaseForHandover(completion))
             .expect("channel closed");
+    }
+
+    pub(crate) fn is_forwarding(&self) -> bool {
+        self.forwarding.get()
     }
 
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
@@ -566,6 +575,7 @@ struct CaptureRegistration {
 }
 
 struct CaptureTask {
+    forwarding: Rc<Cell<bool>>,
     active_client: Option<CaptureHandle>,
     /// DTLS generation that owns `active_client`. Every event after Begin is
     /// pinned to it so a replacement connection cannot inherit the crossing.
@@ -1682,6 +1692,8 @@ impl CaptureTask {
             let command_as_ctrl = cfg!(target_os = "macos") && self.command_as_ctrl(handle);
             self.command_ctrl_mapper.reset(command_as_ctrl);
             let changed_client = self.active_client.replace(handle) != Some(handle);
+            self.forwarding.set(true);
+            let _ = self.event_tx.send(ICaptureEvent::InputForwarding(true));
             // Use the exact session whose Hello readiness was checked above.
             // If it is replaced during one of the preceding async cleanup
             // operations, send_on_session rejects it rather than falling
@@ -1928,6 +1940,8 @@ impl CaptureTask {
 
         self.stop_user_activity();
         self.active_client = None;
+        self.forwarding.set(false);
+        let _ = self.event_tx.send(ICaptureEvent::InputForwarding(false));
         self.active_session = None;
         self.active_handover_serial = None;
         self.modeling_disabled_for = None;
@@ -1988,6 +2002,8 @@ impl CaptureTask {
 
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            self.forwarding.set(false);
+            let _ = self.event_tx.send(ICaptureEvent::InputForwarding(false));
             let session = self.active_session.take();
             let handover_serial = self.active_handover_serial.take();
             // Synthesize key-up events for every logical key still held
@@ -2168,6 +2184,7 @@ mod command_ctrl_tests {
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         CaptureTask {
+            forwarding: Rc::new(Cell::new(active_client.is_some())),
             active_client,
             active_session: active_client.map(|_| 11),
             backend: None,

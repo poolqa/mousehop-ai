@@ -305,8 +305,11 @@ impl OutgoingTransfer {
         self.stream_offer.clone()
     }
 
-    pub(crate) async fn serve(self) -> Result<(), BulkTransportError> {
-        let stream = timeout(Duration::from_secs(15), async {
+    pub(crate) async fn serve_if_current(
+        self,
+        version: Option<u64>,
+    ) -> Result<(), BulkTransportError> {
+        let waiting = async {
             loop {
                 let (stream, peer) = self.listener.accept().await?;
                 if peer.ip() == self.expected_peer {
@@ -314,12 +317,19 @@ impl OutgoingTransfer {
                 }
                 log::debug!("ignoring clipboard-v2 bulk connection from unexpected peer {peer}");
             }
-        })
-        .await
-        .map_err(|_| BulkTransportError::HandshakeTimeout)??;
+        };
+        // A file offer is idle until the user explicitly chooses Paste Files.
+        // The service aborts this task on a new copy, disconnect or revocation.
+        let stream = if self.payload.kind == ClipboardItemKind::FileTree {
+            waiting.await?
+        } else {
+            timeout(Duration::from_secs(15), waiting)
+                .await
+                .map_err(|_| BulkTransportError::HandshakeTimeout)??
+        };
         let mut session =
             BulkSession::accept(stream, self.stream_offer.offer.transfer_id, self.key).await?;
-        send_payload(&mut session, &self.payload).await?;
+        send_payload_for_copy(&mut session, &self.payload, version).await?;
         match timeout(Duration::from_secs(15), session.receive()).await {
             Ok(Ok(BulkFrame::Complete)) => session.shutdown().await,
             Ok(Ok(_)) | Ok(Err(_)) => Err(BulkTransportError::Authentication),
@@ -328,6 +338,7 @@ impl OutgoingTransfer {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn send_payload<S>(
     session: &mut BulkSession<S>,
     payload: &OutgoingPayload,
@@ -335,22 +346,45 @@ pub(crate) async fn send_payload<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    send_payload_for_copy(session, payload, None).await
+}
+
+async fn send_payload_for_copy<S>(
+    session: &mut BulkSession<S>,
+    payload: &OutgoingPayload,
+    version: Option<u64>,
+) -> Result<(), BulkTransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     for item in payload.items.iter() {
+        check_copy_version(version)?;
         if let Some(manifest) = &item.manifest {
             session.send(&BulkFrame::Manifest(manifest.clone())).await?;
         }
         if let Some(source) = &item.source {
-            send_item(session, item.index, source).await?;
+            send_item(session, item.index, source, version).await?;
         }
     }
     session.send(&BulkFrame::Complete).await?;
     Ok(())
 }
 
+fn check_copy_version(version: Option<u64>) -> Result<(), BulkTransportError> {
+    if version.is_some() && input_capture::clipboard::native_clipboard_version() != version {
+        Err(BulkTransportError::InvalidPayload(
+            "File copy expired".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 async fn send_item<S>(
     session: &mut BulkSession<S>,
     item_index: u32,
     source: &PayloadSource,
+    version: Option<u64>,
 ) -> Result<(), BulkTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -372,9 +406,22 @@ where
             }
         }
         PayloadSource::File(path) => {
+            #[cfg(windows)]
+            let mut file = {
+                let path = path.clone();
+                let file = tokio::task::spawn_blocking(move || {
+                    let _access = crate::windows_service::desktop_file_access()?;
+                    std::fs::File::open(path)
+                })
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))??;
+                File::from_std(file)
+            };
+            #[cfg(not(windows))]
             let mut file = File::open(path).await?;
             let mut buffer = vec![0; MAX_CLIPBOARD_CHUNK_SIZE];
             loop {
+                check_copy_version(version)?;
                 let read = file.read(&mut buffer).await?;
                 if read == 0 {
                     break;

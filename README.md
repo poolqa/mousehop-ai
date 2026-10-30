@@ -613,7 +613,7 @@ Each direction is independently gated. Both ends must opt in for clipboard data 
 - **Outgoing**: `clipboard_send` on each `[[clients]]` entry — when true, copies on this device propagate to that peer.
 - **Incoming**: `clipboard_receive` on each `[authorized_fingerprints]` entry — when true, clipboard data from that peer is applied to this device's clipboard.
 
-Defaults are `false`. Existing pairs see no behavior change on upgrade.
+Defaults are `false`. Text and image sync retain their existing behavior.
 
 ### Limitations
 
@@ -623,10 +623,32 @@ Defaults are `false`. Existing pairs see no behavior change on upgrade.
   separately authenticated, encrypted TCP stream. Mouse/keyboard traffic stays
   on DTLS and is not queued behind the copy. Legacy peers retain the **4 KiB**
   DTLS text limit; larger copies are skipped for those peers.
-- File lists use the native clipboard representation on Windows, macOS, and
-  Linux. Symbolic links and special filesystem entries are rejected; received
-  files remain in a private staging directory for as long as the clipboard or
-  an in-flight forwarded transfer references them.
+- File contents are sent only when you paste on the receiving computer. Copy
+  files normally in Explorer/Finder, then use **Ctrl+V / Shift+Insert** in
+  Windows Explorer or **Command+V** in Finder, or choose the regular **Paste**
+  menu item. Mousehop automatically receives the files into that destination
+  and opens a separate progress window, even with settings hidden in the tray.
+  No Mousehop button or destination-folder dialog is required. **Cancel** or
+  closing the progress window cancels the transfer. Successful completion stays
+  visible for two seconds, then closes automatically; failed or cancelled
+  results stay open until dismissed.
+- A new copy on either machine (including text, images, or clearing the
+  clipboard) invalidates the pending file offer. Pasting locally without a new
+  copy does not invalidate it. One offer permits one paste; copy again to retry
+  or paste into another folder. Existing destination names are never overwritten.
+- Automatic file paste currently integrates Windows Explorer and macOS Finder
+  (English and Chinese regular Paste menus). Rename/search/text fields and
+  special paste commands are excluded. Mousehop must be running in the tray/
+  menu bar. On installed Windows, the service alone cannot detect incoming
+  native file pastes or display progress: launch Mousehop Settings once, then
+  close its window to leave the GUI running in the system tray. Choosing Quit
+  stops that GUI even though the Windows service continues running.
+  macOS requires Accessibility and Input Monitoring permissions;
+  Finder automation may also request permission to determine its insertion
+  folder. No macFUSE or system extension is required. A destination that cannot
+  be confirmed is rejected rather than guessed. Both computers need updated
+  builds; older peers are skipped instead of transferring files in the background.
+  Symbolic links and special files are rejected.
 - Rich text/HTML and arbitrary custom pasteboard formats are not synchronized.
 - Text is UTF-8 only; invalid byte sequences are rejected.
 - Polling-based change detection (no native pasteboard event API exists on macOS), so very rapid recopies within a single poll tick may be coalesced.

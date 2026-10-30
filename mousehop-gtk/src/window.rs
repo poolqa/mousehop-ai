@@ -751,7 +751,7 @@ impl Window {
         self.request(FrontendRequest::RemoveAuthorizedKey(fp));
     }
 
-    fn request(&self, request: FrontendRequest) {
+    pub(crate) fn request(&self, request: FrontendRequest) {
         let result = {
             let mut writer = self.imp().frontend_request_writer.borrow_mut();
             match writer.as_mut() {
@@ -769,6 +769,7 @@ impl Window {
     }
 
     pub(super) fn disconnect_frontend(&self) {
+        self.file_paste_available(None);
         self.imp().frontend_request_writer.borrow_mut().take();
         self.show_toast("Mousehop service disconnected. Reconnecting…");
     }
@@ -783,6 +784,27 @@ impl Window {
             .borrow_mut()
             .replace(conn);
         self.request(FrontendRequest::Sync);
+    }
+
+    pub(super) fn native_paste_forwarding(&self, forwarding: bool) {
+        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
+            panel.set_forwarding(forwarding);
+        }
+    }
+    pub(super) fn prepare_native_file_paste(&self, id: [u8; 16], version: Option<u64>) {
+        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
+            panel.prepare_native(id, version);
+        }
+    }
+    pub(super) fn file_paste_available(&self, offer: Option<mousehop_ipc::FilePasteOffer>) {
+        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
+            panel.available(offer);
+        }
+    }
+    pub(super) fn file_paste_progress(&self, progress: mousehop_ipc::FilePasteProgress) {
+        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
+            panel.update(progress);
+        }
     }
 
     pub(super) fn show_toast(&self, msg: &str) {

@@ -597,6 +597,14 @@ pub enum RemoteHostState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    InputForwarding(bool),
+    PrepareNativeFilePaste {
+        id: [u8; 16],
+        clipboard_version: Option<u64>,
+    },
+    /// Only metadata; no file content is downloaded until PasteFiles.
+    FilePasteAvailable(Option<FilePasteOffer>),
+    FilePasteProgress(FilePasteProgress),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -642,7 +650,9 @@ pub enum FrontendEvent {
         state: RemoteHostState,
     },
     /// failed connection attempt (approval for fingerprint required)
-    ConnectionAttempt { fingerprint: String },
+    ConnectionAttempt {
+        fingerprint: String,
+    },
     /// pixel threshold for the wall-press auto-release fallback.
     /// 0 means disabled.
     ReleaseThreshold(u32),
@@ -674,6 +684,34 @@ pub enum FrontendEvent {
     RunningApps(Vec<RunningApp>),
 }
 
+/// File paste control v1. Transfer IDs bind a native paste intent to the exact
+/// copy offered, so a newer copy cannot redirect an intercepted command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilePasteOffer {
+    pub id: [u8; 16],
+    pub source: String,
+    pub item_count: u32,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FilePastePhase {
+    Receiving,
+    Saving,
+    Complete,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilePasteProgress {
+    pub id: [u8; 16],
+    pub received: u64,
+    pub total: u64,
+    pub phase: FilePastePhase,
+    pub message: Option<String>,
+}
+
 /// One running-app candidate for the suppression-list picker. The
 /// `identifier` is the host-OS string the runtime suppression check
 /// compares against (bundle ID on macOS, exe basename on Windows,
@@ -694,6 +732,25 @@ pub struct RunningApp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    PrepareNativeFilePaste {
+        id: [u8; 16],
+    },
+    NativeFilePastePrepared {
+        id: [u8; 16],
+        clipboard_version: Option<u64>,
+        error: Option<String>,
+    },
+    NativeFilePasteFailed {
+        id: [u8; 16],
+        message: String,
+    },
+    PasteFiles {
+        id: [u8; 16],
+        destination: std::path::PathBuf,
+    },
+    CancelFilePaste {
+        id: [u8; 16],
+    },
     /// activate/deactivate client
     Activate(ClientHandle, bool),
     /// add a new client

@@ -325,6 +325,10 @@ impl MacOSEmulation {
         if let Some(button_number) = spec.button_number {
             event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button_number);
         }
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            input_event::MACOS_INPUT_EVENT_TAG,
+        );
         event.post(CGEventTapLocation::HID);
         true
     }
@@ -724,6 +728,10 @@ fn post_key_event(
     };
     event.set_flags(key_event_flags(key, modifiers, event.get_flags()));
     event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, autorepeat as i64);
+    event.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        input_event::MACOS_INPUT_EVENT_TAG,
+    );
     event.post(KEYBOARD_EVENT_TAP_LOCATION);
     log::trace!("key event: {key} {state}");
 }
@@ -775,6 +783,10 @@ fn modifier_key_event(
     };
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(modifier_flags(modifiers, physical));
+    event.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        input_event::MACOS_INPUT_EVENT_TAG,
+    );
     event.post(KEYBOARD_EVENT_TAP_LOCATION);
     log::trace!("modifier key event: {key} {state}");
 }
@@ -958,6 +970,10 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        event.set_integer_value_field(
+                            EventField::EVENT_SOURCE_USER_DATA,
+                            input_event::MACOS_INPUT_EVENT_TAG,
+                        );
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {
@@ -1008,6 +1024,10 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        event.set_integer_value_field(
+                            EventField::EVENT_SOURCE_USER_DATA,
+                            input_event::MACOS_INPUT_EVENT_TAG,
+                        );
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
@@ -1034,6 +1054,10 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        event.set_integer_value_field(
+                            EventField::EVENT_SOURCE_USER_DATA,
+                            input_event::MACOS_INPUT_EVENT_TAG,
+                        );
                         event.post(CGEventTapLocation::HID);
                     }
                 }

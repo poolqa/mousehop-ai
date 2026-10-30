@@ -109,6 +109,8 @@ mod pipeline_tests {
             pressed_keys: HashMap::new(),
             post_processing: HashMap::new(),
             clipboard: None,
+            #[cfg(windows)]
+            desktop_generation: 0,
         };
         emulation.create(1).await;
         emulation.create(2).await;

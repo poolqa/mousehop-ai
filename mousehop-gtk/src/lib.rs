@@ -2,6 +2,7 @@ mod authorization_window;
 mod client_object;
 mod client_row;
 mod clipboard_privacy_window;
+mod file_paste;
 mod fingerprint_window;
 mod glyph_font;
 mod i18n;
@@ -614,6 +615,17 @@ fn build_ui(app: &Application) {
                     Err(_) => process::exit(1),
                 };
                 match notify {
+                    FrontendEvent::InputForwarding(forwarding) => {
+                        window.native_paste_forwarding(forwarding)
+                    }
+                    FrontendEvent::PrepareNativeFilePaste {
+                        id,
+                        clipboard_version,
+                    } => window.prepare_native_file_paste(id, clipboard_version),
+                    FrontendEvent::FilePasteAvailable(offer) => window.file_paste_available(offer),
+                    FrontendEvent::FilePasteProgress(progress) => {
+                        window.file_paste_progress(progress)
+                    }
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)
                     }

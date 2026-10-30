@@ -829,3 +829,58 @@ async fn helper_clipboard(
     }
     std::future::pending().await
 }
+
+/// Filesystem work uses the logged-in user's access rights, never SYSTEM's.
+/// This guard must stay on a blocking thread and must not span an await.
+/// Unlike OLE clipboard access, filesystem APIs honor thread impersonation.
+pub(crate) struct DesktopFileAccess(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+impl Drop for DesktopFileAccess {
+    fn drop(&mut self) {
+        if self.0 && unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
+            // A pooled thread must never escape with another user's identity.
+            std::process::abort();
+        }
+    }
+}
+pub(crate) fn desktop_file_access() -> io::Result<DesktopFileAccess> {
+    use windows::Win32::Security::{
+        GetTokenInformation, ImpersonateLoggedOnUser, TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN,
+        TokenElevationType, TokenElevationTypeFull, TokenLinkedToken,
+    };
+    if mousehop_ipc::windows::process_sid(unsafe { GetCurrentProcess() })? != "S-1-5-18" {
+        return Ok(DesktopFileAccess(false, std::marker::PhantomData));
+    }
+    if secure_desktop() || session_id()? != unsafe { WTSGetActiveConsoleSessionId() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Desktop user is unavailable",
+        ));
+    }
+    unsafe {
+        let mut raw = HANDLE::default();
+        windows::Win32::System::RemoteDesktop::WTSQueryUserToken(session_id()?, &mut raw)?;
+        let mut token = Handle(raw);
+        let mut elevation = TOKEN_ELEVATION_TYPE::default();
+        let mut size = 0;
+        GetTokenInformation(
+            token.0,
+            TokenElevationType,
+            Some((&mut elevation as *mut TOKEN_ELEVATION_TYPE).cast()),
+            size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut size,
+        )?;
+        if elevation == TokenElevationTypeFull {
+            let mut linked = TOKEN_LINKED_TOKEN::default();
+            GetTokenInformation(
+                token.0,
+                TokenLinkedToken,
+                Some((&mut linked as *mut TOKEN_LINKED_TOKEN).cast()),
+                size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut size,
+            )?;
+            token = Handle(linked.LinkedToken);
+        }
+        ImpersonateLoggedOnUser(token.0)?;
+    }
+    Ok(DesktopFileAccess(true, std::marker::PhantomData))
+}

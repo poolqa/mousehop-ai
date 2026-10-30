@@ -26,6 +26,58 @@ pub fn write_windows_clipboard_snapshot() -> std::io::Result<()> {
     crate::windows::clipboard_reader::write_snapshot()
 }
 
+/// Native clipboard generation, including copies with unchanged contents and
+/// empty/concealed clipboard updates. Reading it does not read clipboard data.
+pub fn native_clipboard_version() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        Some(unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() } as u64)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(pasteboard_change_count() as u64)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Revalidate a queued file copy before offering it. This also covers changes
+/// between the Windows desktop helper sending a report and the service reading it.
+pub fn current_file_copy_matches(paths: &[std::path::PathBuf]) -> bool {
+    let Ok(mut clipboard) = Clipboard::new() else {
+        return false;
+    };
+    let current = clipboard
+        .get()
+        .file_list()
+        .ok()
+        .filter(|paths| !paths.is_empty());
+    #[cfg(windows)]
+    let current = current.or_else(|| {
+        crate::windows::clipboard_reader::read_as_desktop_user()
+            .ok()
+            .filter(|paths| !paths.is_empty())
+    });
+    let Some(current) = current else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        current
+            .iter()
+            .map(|path| input_event::windows_clipboard_path_key(path))
+            .eq(paths
+                .iter()
+                .map(|path| input_event::windows_clipboard_path_key(path)))
+    }
+    #[cfg(not(windows))]
+    {
+        current == paths
+    }
+}
+
 /// Shared, mutable suppression list. Service owns the canonical
 /// `Arc<Mutex<HashSet<AppIdent>>>` and clones the handle into each
 /// freshly-spawned [`ClipboardMonitor`]; mutations from
@@ -41,6 +93,7 @@ pub struct ClipboardMonitor {
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
     revision: Arc<AtomicU64>,
+    native_version: Arc<Mutex<Option<u64>>>,
 }
 
 impl ClipboardMonitor {
@@ -64,6 +117,8 @@ impl ClipboardMonitor {
         let enabled = Arc::new(Mutex::new(true));
         let revision = Arc::new(AtomicU64::new(0));
         let poll_revision = revision.clone();
+        let native_version = Arc::new(Mutex::new(native_clipboard_version()));
+        let poll_native_version = native_version.clone();
 
         let last_content_clone = last_content.clone();
         let last_change_clone = last_change.clone();
@@ -118,6 +173,7 @@ impl ClipboardMonitor {
                 let event_tx_clone2 = event_tx_clone.clone();
                 let suppression_clone2 = suppression_clone.clone();
 
+                let native_version_clone = poll_native_version.clone();
                 let revision_clone = poll_revision.clone();
                 let observed_revision = revision_clone.load(Ordering::SeqCst);
                 let read_result = spawn_blocking(move || {
@@ -135,6 +191,7 @@ impl ClipboardMonitor {
                         None => return false,
                     };
                     let signature = clipboard_signature(&current);
+                    let version = native_clipboard_version();
 
                     // Check if content changed
                     let mut last_content = last_content_clone2.lock().unwrap();
@@ -143,6 +200,7 @@ impl ClipboardMonitor {
                         return true;
                     }
 
+                    let mut last_version = native_version_clone.lock().unwrap();
                     let last_change_elapsed = last_change.map(|t| t.elapsed());
                     // App-source suppression. Frontmost-app lookup
                     // and the macOS concealed-pasteboard probe both
@@ -150,7 +208,8 @@ impl ClipboardMonitor {
                     // actually changed (see PollDecision::classify).
                     // Pre-compute the inputs here so the classifier
                     // stays a pure function.
-                    let changed = last_content.as_ref() != Some(&signature);
+                    let changed = last_content.as_ref() != Some(&signature)
+                        || version.is_some() && version != *last_version;
                     let needs_decision =
                         PollDecision::content_might_emit(changed, last_change_elapsed);
                     let (concealed, suppressed) = if needs_decision {
@@ -186,6 +245,7 @@ impl ClipboardMonitor {
                     // contract — see the unit tests at the
                     // bottom of this file.
                     if decision.advances_state() {
+                        *last_version = version;
                         *last_content = Some(signature);
                         *last_change = Some(Instant::now());
                     }
@@ -246,6 +306,7 @@ impl ClipboardMonitor {
             last_change,
             enabled,
             revision,
+            native_version,
         })
     }
 
@@ -280,6 +341,7 @@ impl ClipboardMonitor {
         let mut last_change = self.last_change.lock().unwrap();
         // Invalidate reads and queued events from before remote publication.
         self.revision.fetch_add(1, Ordering::SeqCst);
+        *self.native_version.lock().unwrap() = native_clipboard_version();
         *last_content = Some(clipboard_signature(event));
         *last_change = Some(Instant::now());
     }
@@ -293,7 +355,16 @@ impl ClipboardMonitor {
 /// checked before text because desktop clipboards commonly expose copied files
 /// as both a native file list and `text/uri-list`.
 fn read_clipboard_event(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
+    if crate::native_paste::marker_id().is_some() {
+        return None;
+    }
     if let Ok(paths) = clipboard.get().file_list() {
+        if paths
+            .iter()
+            .any(|path| crate::native_paste::is_marker_path(path))
+        {
+            return None;
+        }
         if !paths.is_empty() {
             return Some(ClipboardEvent::Files {
                 paths,
@@ -320,6 +391,12 @@ fn read_clipboard_event(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
         });
         match files {
             Ok(paths) if !paths.is_empty() => {
+                if paths
+                    .iter()
+                    .any(|path| crate::native_paste::is_marker_path(path))
+                {
+                    return None;
+                }
                 return Some(ClipboardEvent::Files {
                     paths,
                     owned_root: None,
@@ -598,6 +675,7 @@ mod tests {
             last_change: Arc::new(Mutex::new(None)),
             enabled: Arc::new(Mutex::new(true)),
             revision: Arc::new(AtomicU64::new(0)),
+            native_version: Arc::new(Mutex::new(None)),
         };
         tx.send((
             0,

@@ -12,6 +12,7 @@ mod discovery;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+mod file_paste;
 pub mod firewall;
 mod latency;
 mod listen;

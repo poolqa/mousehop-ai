@@ -17,13 +17,63 @@ formats they cannot publish.
 
 Bulk receivers must validate `TransferLimits` before accepting an offer, write
 file chunks into a transfer-specific staging directory, verify item digests,
-and only publish the resulting local paths to the OS clipboard after the whole
-transfer completes. Manifest paths are normalized relative `/` paths; absolute
+and decode text/images only after the whole transfer completes. File offers
+are handled by `mousehop::file_paste`: receiving an offer must not connect to
+the bulk port. The user-session GUI prepares a protected local marker solely
+to enable the file manager's native Paste command; it is never a received file.
+A captured native paste produces a frontend `PasteFiles` request binding the
+exact transfer ID to the confirmed file-manager destination folder. The
+one-shot stream opens only for that request. Verified files are then copied
+with create-new semantics, retaining a rollback list of only paths created by
+this paste; existing names and symlinks are never overwritten. Cancellation
+also removes partial output created by the operation. Manifest paths are normalized relative `/` paths; absolute
 paths, traversal components, Windows drive roots, and backslashes are rejected
 by the protocol codec. Symbolic links and special filesystem entries are not
 sent. Received file trees carry a shared lifetime lease: replacing the local
 clipboard releases its lease, while in-flight fan-out tasks retain theirs, and
 the staging directory is removed only after the last lease is dropped.
+
+Explicit file paste is negotiated by `CAP_EXPLICIT_FILE_PASTE`; senders never
+send file offers to older peers. `FilePasteCancel` uses a new appended event tag
+and a version-1 control payload, leaving existing event tags and bulk framing
+unchanged. Waiting file-source tasks have no 15-second paste deadline; a new
+copy, disconnect, permission revocation, or shutdown aborts them. Source native
+clipboard generations are checked before each file chunk. A cancelled listener
+cannot serve an obsolete offer even if its revocation datagram is lost.
+On Windows/macOS the service also polls the native clipboard generation to
+invalidate offers on empty or concealed copies without exposing their content.
+The monitor notices recopies of identical content, and queued source file paths
+are revalidated against the current clipboard before an offer is announced.
+File offers are not forwarded around peer rings. `input_capture::native_paste`
+runs input hooks in the desktop user process. Accessibility queries run on
+separate workers, not inside low-level hooks. A native paste is intercepted only
+for Finder/Explorer and a current offer, excludes editable text fields, and
+confirms the foreground window/folder again before sending the request. Physical
+input being forwarded to a peer is excluded; tagged Mousehop input emulated on
+the receiving host remains eligible. Menu selections are confirmed against the
+live, enabled Paste item before cancelling native menu tracking and requesting
+transfer. Native clipboard preparation is validated by the user-process bridge
+and acknowledged across IPC by offer ID and clipboard generation; SYSTEM does
+not attempt to inspect the user process's OLE marker. Its own clipboard mutation
+therefore does not revoke the offer. Markers cannot be read as file
+contents and clipboard capture ignores them. Markers are cleared only while the
+clipboard still has the exact generation Mousehop published, preserving a newer
+user copy. The GUI opens an independent progress/cancel window without exposing
+the settings window. Each new paste raises that popup, even if the previous
+completed popup remains open behind another application. macOS activates the
+app and exposes its Dock icon until the last visible window closes; Windows
+briefly raises the popup above normal windows without leaving it always on top.
+Periodic progress updates do not take focus again. A successful result closes
+automatically after two seconds; failed/cancelled results remain visible. Each
+progress update invalidates previous completion timers, so an earlier paste
+cannot close the window while a newer transfer is running. Completion means
+destination files have been written, not
+merely received into staging. No FUSE or shell extension is installed.
+Windows blocking filesystem work impersonates the logged-in user's limited
+access token for source opens and destination writes; it never uses SYSTEM's
+filesystem privileges. The guard cannot cross an await and always reverts
+before its pooled thread is reused. OLE clipboard reads continue to require
+the separate user process described below.
 
 The transport implementation is split between
 `mousehop::clipboard_bulk` and `mousehop::clipboard_receive`. Bulk frames use
@@ -37,7 +87,9 @@ encrypted length before allocation, streams chunks to a fresh temporary
 directory, requires contiguous offsets, and verifies SHA-256 before making an
 item complete. The source waits for a completion acknowledgement before
 considering the copy delivered. The bulk acknowledgement confirms validated
-staging; Windows desktop publication is confirmed separately by the helper.
+staging; explicit file paste reports completion separately after saving to
+the chosen folder. Windows text/image clipboard publication is confirmed
+separately by the helper.
 The local desktop-helper pipe uses v2 frames with publication IDs and revision-tagged
 clipboard reports. Pending publications retain their staging leases until applied
 or rejected; stale reports cannot release newer files. Captured file lists inherit
@@ -395,17 +447,28 @@ Windows runtime acceptance (requires a Windows 10/11 x64 machine and a paired pe
    check the PID/path confirmation; declining must leave it running. In silent
    mode a port conflict must fail with those details and no confirmation dialog.
    Confirm installation succeeds when PowerShell is disabled by machine policy.
-8. In the logged-in user's Explorer, copy a local file and paste it in the peer's
-   file manager. Repeat in reverse, then copy a different Windows source file
-   immediately after receiving a remote file. Confirm the source copy replaces
-   the received clipboard, the service logs a changed file list, and both pasted
-   files have the expected contents. Repeat after switching console users. A
-   failed FileDrop read must log a retry and must not publish a text fallback.
-   In installed service mode, enable debug logging and verify Explorer copies
-   produce `Desktop user clipboard snapshot: ... files=1` and reach the peer.
-   Copy a Chinese-named CSV, a second file, plain text, and
-   clear the clipboard; verify the reader does not repeat idle launches, expose
-   a console, or leave child processes behind after stop/UAC/lock transitions.
+8. Pair two builds supporting explicit file paste. Copy a Chinese-named CSV
+   and a folder containing files and an empty directory in Explorer/Finder.
+   Confirm copying alone sends no file-content bytes even after 15 seconds.
+   Keep the receiving Mousehop settings hidden. In its Finder/Explorer open a
+   writable folder and use the normal paste shortcut, the Edit menu, and the
+   context menu. Confirm that each triggers Mousehop automatically, without a
+   Mousehop button/folder picker, and verify its independent progress window,
+   saving, completion and resulting file contents.
+   Repeat in reverse and in installed/portable Windows modes. Local-only
+   copies/pastes must not transfer files. Copy text/images, clear the clipboard,
+   or copy a concealed value before/during a pending paste; it must expire or
+   cancel, clean partial output, and never send the concealed content. Recopy
+   the same file to create a fresh offer. Change the clipboard or destination
+   window between interception and confirmation; the old request must fail.
+   Confirm rename/search/text fields paste normally, and input still being
+   captured for a peer never pastes into the source host's stale file window.
+   On macOS verify Accessibility/Input Monitoring and Finder-automation grants;
+   on Windows verify both classic and modern Explorer context menus.
+   Test cancellation during receive/save, a read-only folder, existing names,
+   disconnect, permission revocation, lock/UAC and console-user changes. No
+   destination write may exceed the ordinary user's filesystem permissions.
+   Verify text/image clipboard sync and Windows user-reader behavior still work.
 
 Automated checks: `cargo test -p mousehop-ipc -p mousehop --lib`,
 `cargo clippy --workspace --all-targets --all-features`, and a Windows-target

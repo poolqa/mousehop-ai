@@ -88,6 +88,31 @@ pub const CAP_CLIPBOARD_IMAGE: u32 = 1 << 3;
 /// Peer can materialize file-tree clipboard transfers.
 pub const CAP_CLIPBOARD_FILES: u32 = 1 << 4;
 
+/// File offers require explicit Mousehop paste, with revocable one-shot streams.
+pub const CAP_EXPLICIT_FILE_PASTE: u32 = 1 << 5;
+pub const FILE_PASTE_CONTROL_VERSION: u8 = 1;
+
+#[cfg(test)]
+mod file_paste_control_tests {
+    use super::*;
+    #[test]
+    fn cancellation_is_versioned_bounded_and_preserves_the_transfer_id() {
+        let id = [0x41; 16];
+        let (bytes, length): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::FilePasteCancel(id).into();
+        assert_eq!(length, 18);
+        assert!(
+            matches!(decode_fixed_event(&bytes[..length]).unwrap(), ProtoEvent::FilePasteCancel(decoded) if decoded == id)
+        );
+        for length in 0..18 {
+            assert!(decode_fixed_event(&bytes[..length]).is_err());
+        }
+        let mut wrong_version = bytes;
+        wrong_version[1] = 255;
+        assert!(decode_fixed_event(&wrong_version[..18]).is_err());
+        assert_ne!(PROTOCOL_CAPABILITIES & CAP_EXPLICIT_FILE_PASTE, 0);
+    }
+}
+
 /// Capabilities implemented completely by this protocol build. Clipboard-v2
 /// bits are enabled individually only after the bulk transport and the
 /// corresponding platform backend are wired end to end.
@@ -95,7 +120,8 @@ pub const PROTOCOL_CAPABILITIES: u32 = CAP_ATOMIC_HANDOVER
     | CAP_TRANSACTIONAL_HANDOVER
     | CAP_CLIPBOARD_V2
     | CAP_CLIPBOARD_IMAGE
-    | CAP_CLIPBOARD_FILES;
+    | CAP_CLIPBOARD_FILES
+    | CAP_EXPLICIT_FILE_PASTE;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -287,6 +313,8 @@ pub enum ProtoEvent {
     },
     /// Announces a separately encrypted reliable clipboard stream.
     ClipboardStreamOffer(ClipboardStreamOffer),
+    /// Revokes a pending file offer without changing the OS clipboard.
+    FilePasteCancel([u8; 16]),
     /// Confirmed lock/unlock state of the capturing host. A locked sender has
     /// already released capture; an unlocked event is informational and does
     /// not resume forwarding without a fresh edge crossing.
@@ -394,6 +422,7 @@ impl Display for ProtoEvent {
                     content.len(),
                 )
             }
+            ProtoEvent::FilePasteCancel(id) => write!(f, "FilePasteCancel({id:02x?})"),
             ProtoEvent::ClipboardStreamOffer(stream) => write!(
                 f,
                 "ClipboardStreamOffer({}, {:?}, {}b, port={})",
@@ -490,6 +519,8 @@ pub enum EventType {
     OwnershipLost,
     /// Small clipboard-v2 control offer. Appended for wire stability.
     ClipboardStreamOffer,
+    /// Versioned cancellation for explicit, one-shot file paste.
+    FilePasteCancel,
 }
 
 fn input_event_wire_len(event_type: EventType) -> Option<usize> {
@@ -601,6 +632,7 @@ impl ProtoEvent {
             ProtoEvent::ReceiverSensitivity { .. } => EventType::ReceiverSensitivity,
             ProtoEvent::Clipboard { .. } => EventType::Clipboard,
             ProtoEvent::ClipboardStreamOffer(_) => EventType::ClipboardStreamOffer,
+            ProtoEvent::FilePasteCancel(_) => EventType::FilePasteCancel,
             ProtoEvent::HostInputState { .. } => EventType::HostInputState,
             ProtoEvent::HostInputStateAck { .. } => EventType::HostInputStateAck,
             ProtoEvent::DisplayLayout { .. } => EventType::DisplayLayout,
@@ -628,6 +660,16 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             | EventType::KeyboardKey
             | EventType::KeyboardModifiers) => {
                 Ok(Self::Input(decode_input_payload(event_type, &mut buf)?))
+            }
+            EventType::FilePasteCancel => {
+                if decode_u8(&mut buf)? != FILE_PASTE_CONTROL_VERSION {
+                    return Err(ProtocolError::BufferTooSmall);
+                }
+                let mut id = [0; 16];
+                for byte in &mut id {
+                    *byte = decode_u8(&mut buf)?;
+                }
+                Ok(Self::FilePasteCancel(id))
             }
             EventType::Ping => Ok(Self::Ping),
             EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
@@ -747,6 +789,7 @@ pub fn decode_fixed_event(bytes: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         EventType::PointerAxisValue120 => (bytes.len() == 6, "6 bytes"),
         EventType::KeyboardKey => (bytes.len() == 10, "10 bytes"),
         EventType::KeyboardModifiers => (bytes.len() == 17, "17 bytes"),
+        EventType::FilePasteCancel => (bytes.len() == 18, "18 bytes"),
         EventType::Ping => (bytes.len() == 1, "1 byte"),
         EventType::Pong | EventType::Enter => (bytes.len() == 2, "2 bytes"),
         EventType::Leave | EventType::Ack => (bytes.len() == 5, "5 bytes"),
@@ -894,6 +937,12 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         "ProtoEvent::Clipboard cannot use the fixed-buffer encoder; \
                          route via encode_clipboard_event"
                     );
+                }
+                ProtoEvent::FilePasteCancel(id) => {
+                    encode_u8(buf, len, FILE_PASTE_CONTROL_VERSION);
+                    for byte in id {
+                        encode_u8(buf, len, byte);
+                    }
                 }
                 ProtoEvent::ClipboardStreamOffer(_) => {
                     panic!(

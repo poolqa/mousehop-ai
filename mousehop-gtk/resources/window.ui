@@ -44,6 +44,9 @@
                     <property name="spacing">24</property>
                     <property name="margin-bottom">36</property>
                     <child>
+                      <object class="GtkBox" id="file_paste_box"/>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup" id="capture_emulation_group">
                       <property name="title" translatable="yes">Capture / Emulation Status</property>
                         <child>

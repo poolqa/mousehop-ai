@@ -247,6 +247,16 @@ fn present_window() {
     });
 }
 
+/// A paste is an explicit user action in Finder. Activate only when its
+/// progress window opens, never for periodic progress updates.
+pub(crate) fn activate_file_paste() {
+    set_activation_policy(ACTIVATION_POLICY_REGULAR);
+    unsafe {
+        let ns_app = msg_send_id(class(c"NSApplication"), sel(c"sharedApplication"));
+        msg_send_void_bool(ns_app, sel(c"activateIgnoringOtherApps:"), 1);
+    }
+}
+
 /// macOS NSApplicationActivationPolicy values.
 /// - `Regular` (0): standard app, Dock icon visible.
 /// - `Accessory` (1): no Dock icon, can have menu-bar item.

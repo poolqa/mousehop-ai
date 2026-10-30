@@ -143,3 +143,13 @@ Authenticated status from {addr}	來自 {addr} 的已驗證狀態
 Accessibility access has been granted. Mousehop needs to quit and reopen for keyboard and mouse capture to take effect.	已取得輔助使用權限。請結束並重新開啟 Mousehop，讓鍵盤與滑鼠擷取功能生效。
 Later	稍後
 Quit & Reopen	結束並重新開啟
+Receiving files…	正在接收檔案…
+Saving files…	正在儲存檔案…
+Files pasted successfully.	檔案貼上完成。
+File paste cancelled. Copy the files again to retry.	已取消檔案貼上。請重新複製檔案後重試。
+File paste failed. Copy the files again to retry.	檔案貼上失敗。請重新複製檔案後重試。
+Remote file paste	跨電腦檔案貼上
+Copy files on another computer, then use Paste in Finder or Explorer.	在另一台電腦複製檔案，再於 Finder 或檔案總管直接貼上。
+Ready from {source}: {count} items ({size}). Use Paste in Finder or Explorer.	來自 {source}：{count} 個項目（{size}）。請在 Finder 或檔案總管直接貼上。
+Copying files	正在複製檔案
+Close	關閉

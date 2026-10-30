@@ -19,6 +19,9 @@ use crate::lock_recovery_window::LockRecoveryWindow;
 #[template(resource = "/com/mousehop/Mousehop/window.ui")]
 pub struct Window {
     #[template_child]
+    pub file_paste_box: TemplateChild<gtk::Box>,
+    pub(crate) file_paste_panel: RefCell<Option<crate::file_paste::FilePastePanel>>,
+    #[template_child]
     pub language_row: TemplateChild<adw::ComboRow>,
     #[template_child]
     pub authorized_placeholder: TemplateChild<ActionRow>,
@@ -320,6 +323,9 @@ impl ObjectImpl for Window {
         let obj = self.obj();
         obj.setup_icon();
         obj.setup_clients();
+        let panel = crate::file_paste::FilePastePanel::new(&obj);
+        self.file_paste_box.append(&panel.widget);
+        self.file_paste_panel.replace(Some(panel));
         obj.setup_authorized();
 
         // Connect the auto-release threshold slider. Stash the handler

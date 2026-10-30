@@ -408,6 +408,15 @@ pub(crate) async fn receive_stream(
     stream_offer: ClipboardStreamOffer,
     limits: TransferLimits,
 ) -> Result<StagedClipboard, StageError> {
+    receive_stream_with_progress(source, stream_offer, limits, |_| {}).await
+}
+
+pub(crate) async fn receive_stream_with_progress(
+    source: SocketAddr,
+    stream_offer: ClipboardStreamOffer,
+    limits: TransferLimits,
+    mut progress: impl FnMut(u64),
+) -> Result<StagedClipboard, StageError> {
     stream_offer.offer.validate_against(limits)?;
     let address = SocketAddr::new(source.ip(), stream_offer.port);
     let stream = tokio::time::timeout(
@@ -423,8 +432,15 @@ pub(crate) async fn receive_stream(
     )
     .await?;
     let mut stager = TransferStager::new(stream_offer.offer, limits)?;
+    let mut last_progress = std::time::Instant::now();
+    progress(0);
     loop {
-        if stager.apply(session.receive().await?)? {
+        let complete = stager.apply(session.receive().await?)?;
+        if complete || last_progress.elapsed() >= std::time::Duration::from_millis(100) {
+            progress(stager.received_total);
+            last_progress = std::time::Instant::now();
+        }
+        if complete {
             let staged = stager.finish()?;
             // Decode text/PNG before acknowledging, so a corrupt payload is
             // reported as a failed transfer rather than published later.

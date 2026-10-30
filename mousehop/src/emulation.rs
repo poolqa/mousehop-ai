@@ -205,6 +205,14 @@ pub(crate) struct Emulation {
 }
 
 pub(crate) enum EmulationEvent {
+    FileOffer {
+        addr: SocketAddr,
+        offer: mousehop_proto::clipboard_transfer::ClipboardStreamOffer,
+    },
+    FileOfferCancelled {
+        addr: SocketAddr,
+        id: [u8; 16],
+    },
     Connected {
         addr: SocketAddr,
         /// Exact inbound DTLS generation that replaced any prior connection
@@ -890,6 +898,9 @@ impl ListenTask {
                                     }).expect("channel closed");
                                 }
                             }
+                            ProtoEvent::FilePasteCancel(id) => {
+                                let _ = self.event_tx.send(EmulationEvent::FileOfferCancelled { addr, id });
+                            }
                             ProtoEvent::ClipboardStreamOffer(stream_offer) => {
                                 #[cfg(windows)]
                                 if crate::windows_service::secure_desktop() { continue; }
@@ -903,6 +914,15 @@ impl ListenTask {
                                         "dropping clipboard-v2 offer from {addr}: clipboard_receive disabled or unauthorized peer"
                                     );
                                 } else {
+                                    if stream_offer.offer.kind == mousehop_proto::clipboard_transfer::ClipboardItemKind::FileTree {
+                                        if peer_capabilities.get(&(addr, session)).copied().unwrap_or(0)
+                                            & mousehop_proto::CAP_EXPLICIT_FILE_PASTE == 0 {
+                                            log::debug!("ignoring legacy automatic file offer from {addr}");
+                                            continue;
+                                        }
+                                        let _ = self.event_tx.send(EmulationEvent::FileOffer { addr, offer: stream_offer });
+                                        continue;
+                                    }
                                     let proxy_tx = self.emulation_proxy.request_tx.clone();
                                     let event_tx = self.event_tx.clone();
                                     let origin = stream_offer.offer.origin_fingerprint.clone();

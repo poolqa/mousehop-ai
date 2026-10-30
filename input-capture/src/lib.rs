@@ -26,6 +26,7 @@ pub mod clipboard;
 pub mod desktop_entries;
 pub mod error;
 pub mod frontmost_app;
+pub mod native_paste;
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;

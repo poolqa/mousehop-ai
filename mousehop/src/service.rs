@@ -8,6 +8,7 @@ use crate::{
     discovery::{Discovery, DiscoveryEvent, PrimaryCache},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    file_paste::{ActivePaste, OutgoingFile, RemoteFileOffer},
     latency::{LatencyProber, ProbeResult},
     listen::{ListenerCreationError, ListenerSession, MousehopListener},
     network::current_network_id,
@@ -19,12 +20,13 @@ use input_event::{ClipboardEvent, Event as InputEvent};
 use local_channel::mpsc::{Receiver, channel};
 use log;
 use mousehop_ipc::{
-    AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FrontendEvent, FrontendRequest,
-    HostKind, IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, RemoteHostState,
-    Status,
+    AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FilePastePhase,
+    FilePasteProgress, FrontendEvent, FrontendRequest, HostKind, IncomingPeerConfig, IpcError,
+    IpcListenerCreationError, Position, RemoteHostState, Status,
 };
 use mousehop_proto::{
-    CAP_CLIPBOARD_FILES, CAP_CLIPBOARD_IMAGE, CAP_CLIPBOARD_V2, MAX_CLIPBOARD_SIZE, ProtoEvent,
+    CAP_CLIPBOARD_FILES, CAP_CLIPBOARD_IMAGE, CAP_CLIPBOARD_V2, CAP_EXPLICIT_FILE_PASTE,
+    MAX_CLIPBOARD_SIZE, ProtoEvent,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -170,6 +172,14 @@ pub struct Service {
     recent_forwarded: HashMap<(String, u64), Instant>,
     // Latest clipboard per peer while its authenticated outbound session connects.
     pending_clipboards: HashMap<ClientHandle, DeferredClipboard>,
+    file_senders: HashMap<ClientHandle, OutgoingFile>,
+    file_offer: Option<RemoteFileOffer>,
+    active_paste: Option<ActivePaste>,
+    file_progress_tx: tokio::sync::mpsc::UnboundedSender<FilePasteProgress>,
+    file_progress_rx: tokio::sync::mpsc::UnboundedReceiver<FilePasteProgress>,
+    last_file_progress: Option<FilePasteProgress>,
+    clipboard_version: Option<u64>,
+    native_arming: Option<([u8; 16], Instant)>,
     /// Shared with [`ClipboardMonitor`]; mutations to the inner
     /// `HashSet` take effect on the next clipboard poll without
     /// rebuilding the monitor.
@@ -369,6 +379,7 @@ impl Service {
         } else {
             None
         };
+        let (file_progress_tx, file_progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let service = Self {
             config,
             capture,
@@ -401,6 +412,14 @@ impl Service {
             desktop_clipboard: None,
             recent_forwarded: HashMap::new(),
             pending_clipboards: HashMap::new(),
+            file_senders: HashMap::new(),
+            file_offer: None,
+            active_paste: None,
+            file_progress_tx,
+            file_progress_rx,
+            last_file_progress: None,
+            clipboard_version: input_capture::clipboard::native_clipboard_version(),
+            native_arming: None,
             clipboard_suppression,
             fastest_streak: HashMap::new(),
         };
@@ -436,7 +455,19 @@ impl Service {
         let mut clipboard_retry = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
-                _ = clipboard_retry.tick(), if !self.pending_clipboards.is_empty() => self.retry_pending_clipboards().await,
+                _ = clipboard_retry.tick() => {
+                    let version = input_capture::clipboard::native_clipboard_version();
+                    if self.native_arming.is_some_and(|(_, started)| started.elapsed() >= Duration::from_secs(5)) {
+                        self.invalidate_file_transfers().await;
+                    }
+                    if version != self.clipboard_version && self.native_arming.is_none() {
+                        self.clipboard_version = version;
+                        self.invalidate_file_transfers().await;
+                    }
+                    self.file_senders.retain(|handle, sender| !sender.task.is_finished() && self.client_manager.alive(*handle));
+                    if !self.pending_clipboards.is_empty() { self.retry_pending_clipboards().await; }
+                },
+                Some(progress) = self.file_progress_rx.recv() => self.file_paste_progress(progress),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
@@ -480,6 +511,68 @@ impl Service {
             Err(e) => return log::error!("error receiving request: {e}"),
         };
         match request {
+            FrontendRequest::PrepareNativeFilePaste { id } => {
+                if let Some(offer) = self
+                    .file_offer
+                    .as_ref()
+                    .filter(|offer| offer.stream.offer.transfer_id.0 == id)
+                {
+                    let version = offer.clipboard_version;
+                    self.native_arming = Some((id, Instant::now()));
+                    self.notify_frontend(FrontendEvent::PrepareNativeFilePaste {
+                        id,
+                        clipboard_version: version,
+                    });
+                }
+            }
+            FrontendRequest::NativeFilePastePrepared {
+                id,
+                clipboard_version,
+                error,
+            } => {
+                if self
+                    .file_offer
+                    .as_ref()
+                    .is_some_and(|offer| offer.stream.offer.transfer_id.0 == id)
+                {
+                    // Installed Windows workers cannot inspect the user's OLE
+                    // clipboard. The user-process bridge validates its marker;
+                    // acknowledge only the outstanding preparation and generation.
+                    let valid = error.is_none()
+                        && self.native_arming.is_some_and(|(arming, _)| arming == id)
+                        && clipboard_version
+                            == input_capture::clipboard::native_clipboard_version();
+                    self.native_arming = None;
+                    if valid {
+                        self.clipboard_version = clipboard_version;
+                        if let Some(offer) = &mut self.file_offer {
+                            offer.clipboard_version = clipboard_version;
+                        }
+                    } else {
+                        self.fail_native_paste(
+                            id,
+                            error.unwrap_or_else(|| {
+                                "Cannot prepare the native Paste command".into()
+                            }),
+                        );
+                    }
+                }
+            }
+            FrontendRequest::NativeFilePasteFailed { id, message } => {
+                self.fail_native_paste(id, message)
+            }
+            FrontendRequest::PasteFiles { id, destination } => {
+                self.start_file_paste(id, destination)
+            }
+            FrontendRequest::CancelFilePaste { id } => {
+                if self
+                    .active_paste
+                    .as_ref()
+                    .is_some_and(|paste| paste.id == id)
+                {
+                    self.cancel_file_paste();
+                }
+            }
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
                 self.save_config().await;
@@ -522,6 +615,7 @@ impl Service {
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
+                self.invalidate_file_transfers().await;
                 self.remove_authorized_key(key);
                 self.save_config().await;
             }
@@ -557,6 +651,9 @@ impl Service {
                 self.save_config().await;
             }
             FrontendRequest::SetClientClipboardSend(handle, enabled) => {
+                if !enabled {
+                    self.invalidate_file_transfers().await;
+                }
                 if self.client_manager.set_clipboard_send(handle, enabled) {
                     self.broadcast_client(handle);
                     self.save_config().await;
@@ -625,6 +722,9 @@ impl Service {
                 }
             }
             FrontendRequest::SetIncomingPeerClipboardReceive(fp, enabled) => {
+                if !enabled {
+                    self.invalidate_file_transfers().await;
+                }
                 self.set_incoming_peer_clipboard_receive(fp, enabled);
                 self.save_config().await;
             }
@@ -805,6 +905,7 @@ impl Service {
     }
 
     async fn handle_config_change(&mut self) {
+        self.invalidate_file_transfers().await;
         self.pending_clipboards.clear();
         for h in self.client_manager.registered_clients() {
             self.remove_client(h).await;
@@ -841,6 +942,55 @@ impl Service {
 
     async fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
+            EmulationEvent::FileOffer { addr, offer } => {
+                let id = offer.offer.transfer_id.0;
+                if self.file_offer.as_ref().is_some_and(|current| {
+                    current.addr == addr && current.stream.offer.transfer_id.0 == id
+                }) || self
+                    .active_paste
+                    .as_ref()
+                    .is_some_and(|current| current.addr == addr && current.id == id)
+                {
+                    return;
+                }
+                if offer.offer.origin_fingerprint == self.public_key_fingerprint
+                    || offer
+                        .offer
+                        .validate_against(
+                            mousehop_proto::clipboard_transfer::TransferLimits::default(),
+                        )
+                        .is_err()
+                {
+                    return;
+                }
+                // Replace the offer in one frontend event. Clearing the old
+                // native marker separately could race preparation of this one.
+                self.file_offer.take();
+                self.invalidate_file_transfers().await;
+                self.clipboard_version = input_capture::clipboard::native_clipboard_version();
+                self.native_arming = Some((id, Instant::now()));
+                self.file_offer = Some(RemoteFileOffer {
+                    addr,
+                    stream: offer,
+                    clipboard_version: self.clipboard_version,
+                });
+                self.notify_file_offer();
+            }
+            EmulationEvent::FileOfferCancelled { addr, id } => {
+                if self.file_offer.as_ref().is_some_and(|offer| {
+                    offer.addr == addr && offer.stream.offer.transfer_id.0 == id
+                }) {
+                    self.file_offer = None;
+                    self.notify_file_offer();
+                }
+                if self
+                    .active_paste
+                    .as_ref()
+                    .is_some_and(|paste| paste.addr == addr && paste.id == id)
+                {
+                    self.cancel_file_paste();
+                }
+            }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
@@ -871,6 +1021,21 @@ impl Service {
                         "ignoring disconnect for stale inbound session {session} from {addr}"
                     );
                     return;
+                }
+                if self
+                    .file_offer
+                    .as_ref()
+                    .is_some_and(|offer| offer.addr == addr)
+                {
+                    self.file_offer = None;
+                    self.notify_file_offer();
+                }
+                if self
+                    .active_paste
+                    .as_ref()
+                    .is_some_and(|paste| paste.addr == addr)
+                {
+                    self.cancel_file_paste();
                 }
                 self.mark_remote_host_unavailable(addr);
                 if let Some(addr) = self.remove_incoming(addr, session) {
@@ -981,6 +1146,8 @@ impl Service {
         let input_capture::CaptureEvent::Input(InputEvent::Clipboard(event)) = event else {
             return;
         };
+        self.clipboard_version = input_capture::clipboard::native_clipboard_version();
+        self.invalidate_file_transfers().await;
         let targets = self.client_manager.clipboard_send_targets();
         if targets.is_empty() {
             log::trace!(
@@ -1016,6 +1183,7 @@ impl Service {
         from_fingerprint: String,
         event: ClipboardEvent,
     ) {
+        self.invalidate_file_transfers().await;
         if let Some(monitor) = self.clipboard_monitor.as_ref() {
             monitor.update_last_event(&event);
         }
@@ -1066,6 +1234,8 @@ impl Service {
         from_fingerprint: String,
         targets: Vec<ClientHandle>,
     ) {
+        let source_version = input_capture::clipboard::native_clipboard_version();
+        let is_file = matches!(event, ClipboardEvent::Files { .. });
         let legacy = match &event {
             ClipboardEvent::Text(content) => {
                 let encoded_size = 1 + 4 + from_fingerprint.len() + 4 + content.len();
@@ -1076,7 +1246,9 @@ impl Service {
         let required_capability = match &event {
             ClipboardEvent::Text(_) => CAP_CLIPBOARD_V2,
             ClipboardEvent::ImageRgba { .. } => CAP_CLIPBOARD_V2 | CAP_CLIPBOARD_IMAGE,
-            ClipboardEvent::Files { .. } => CAP_CLIPBOARD_V2 | CAP_CLIPBOARD_FILES,
+            ClipboardEvent::Files { .. } => {
+                CAP_CLIPBOARD_V2 | CAP_CLIPBOARD_FILES | CAP_EXPLICIT_FILE_PASTE
+            }
         };
         let needs_bulk = legacy.is_none();
         let mut ready_targets = Vec::new();
@@ -1107,15 +1279,26 @@ impl Service {
         }
         let payload = if needs_bulk {
             let source = event.clone();
-            match tokio::task::spawn_blocking(move || match source {
-                ClipboardEvent::Text(content) => OutgoingPayload::text(content),
-                ClipboardEvent::ImageRgba {
-                    width,
-                    height,
-                    bytes,
-                } => OutgoingPayload::image_rgba(width, height, bytes),
-                ClipboardEvent::Files { paths, owned_root } => {
-                    OutgoingPayload::file_tree(paths, owned_root)
+            match tokio::task::spawn_blocking(move || {
+                if let ClipboardEvent::Files { paths, .. } = &source {
+                    if !input_capture::clipboard::current_file_copy_matches(paths) {
+                        return Err(crate::clipboard_bulk::BulkTransportError::InvalidPayload(
+                            "File copy expired".into(),
+                        ));
+                    }
+                }
+                #[cfg(windows)]
+                let _access = crate::windows_service::desktop_file_access()?;
+                match source {
+                    ClipboardEvent::Text(content) => OutgoingPayload::text(content),
+                    ClipboardEvent::ImageRgba {
+                        width,
+                        height,
+                        bytes,
+                    } => OutgoingPayload::image_rgba(width, height, bytes),
+                    ClipboardEvent::Files { paths, owned_root } => {
+                        OutgoingPayload::file_tree(paths, owned_root)
+                    }
                 }
             })
             .await
@@ -1133,6 +1316,9 @@ impl Service {
         } else {
             None
         };
+        if is_file && input_capture::clipboard::native_clipboard_version() != source_version {
+            return;
+        }
         for handle in targets {
             if let Some(content) = legacy.as_ref() {
                 if let Err(error) = self
@@ -1167,6 +1353,7 @@ impl Service {
                     continue;
                 }
             };
+            let transfer_id = transfer.offer().offer.transfer_id.0;
             if let Err(error) = self
                 .conn
                 .send(ProtoEvent::ClipboardStreamOffer(transfer.offer()), handle)
@@ -1175,12 +1362,169 @@ impl Service {
                 log::debug!("clipboard-v2 offer to client {handle} failed: {error}");
                 continue;
             }
-            tokio::task::spawn_local(async move {
-                if let Err(error) = transfer.serve().await {
+            let task = tokio::task::spawn_local(async move {
+                if let Err(error) = transfer
+                    .serve_if_current(if is_file { source_version } else { None })
+                    .await
+                {
                     log::warn!("clipboard-v2 transfer to client {handle} failed: {error}");
                 }
             });
+            if is_file {
+                self.file_senders.insert(
+                    handle,
+                    OutgoingFile {
+                        id: transfer_id,
+                        task,
+                    },
+                );
+            }
         }
+    }
+
+    fn fail_native_paste(&mut self, id: [u8; 16], message: String) {
+        if self
+            .file_offer
+            .as_ref()
+            .is_none_or(|offer| offer.stream.offer.transfer_id.0 != id)
+        {
+            return;
+        }
+        self.file_offer = None;
+        self.native_arming = None;
+        self.notify_file_offer();
+        let progress = FilePasteProgress {
+            id,
+            received: 0,
+            total: 0,
+            phase: FilePastePhase::Failed,
+            message: Some(message),
+        };
+        self.last_file_progress = Some(progress.clone());
+        self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
+    }
+
+    fn notify_file_offer(&mut self) {
+        let summary = self.file_offer.as_ref().map(|offer| {
+            let mut summary = offer.summary();
+            summary.source = self
+                .authorized_keys
+                .read()
+                .unwrap()
+                .get(&summary.source)
+                .map(|peer| peer.description.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| offer.addr.ip().to_string());
+            summary
+        });
+        self.notify_frontend(FrontendEvent::FilePasteAvailable(summary));
+    }
+
+    fn cancel_file_paste(&mut self) {
+        if let Some(paste) = self.active_paste.take() {
+            let progress = FilePasteProgress {
+                id: paste.id,
+                received: 0,
+                total: 0,
+                phase: FilePastePhase::Cancelled,
+                message: None,
+            };
+            drop(paste);
+            self.last_file_progress = Some(progress.clone());
+            self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
+        }
+    }
+
+    async fn invalidate_file_transfers(&mut self) {
+        self.native_arming = None;
+        // Closing the source listener is authoritative even if the revocation
+        // datagram is lost: an obsolete offer cannot fetch file contents.
+        let senders = std::mem::take(&mut self.file_senders);
+        for (handle, sender) in senders {
+            let id = sender.id;
+            drop(sender);
+            let _ = self
+                .conn
+                .send(ProtoEvent::FilePasteCancel(id), handle)
+                .await;
+        }
+        self.pending_clipboards
+            .retain(|_, (event, _, _)| !matches!(event, ClipboardEvent::Files { .. }));
+        if self.file_offer.take().is_some() {
+            self.notify_file_offer();
+        }
+        self.cancel_file_paste();
+    }
+
+    fn start_file_paste(&mut self, id: [u8; 16], destination: std::path::PathBuf) {
+        if self.capture.is_forwarding() {
+            self.fail_native_paste(
+                id,
+                "Input is directed to another computer; paste on the receiving computer".into(),
+            );
+            return;
+        }
+        if self.active_paste.is_some() {
+            self.notify_frontend(FrontendEvent::Error(
+                "A file paste is already in progress".into(),
+            ));
+            return;
+        }
+        let valid = self.file_offer.as_ref().is_some_and(|offer| {
+            offer.is_current(id, input_capture::clipboard::native_clipboard_version())
+        });
+        if !valid {
+            self.notify_frontend(FrontendEvent::Error(
+                "This file copy expired; copy the files again".into(),
+            ));
+            return;
+        }
+        let offer = self.file_offer.take().expect("validated offer");
+        let addr = offer.addr;
+        let total = offer.stream.offer.total_bytes;
+        self.native_arming = None;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::task::spawn_local(crate::file_paste::paste(
+            offer,
+            destination,
+            cancel.clone(),
+            self.file_progress_tx.clone(),
+        ));
+        self.active_paste = Some(ActivePaste {
+            addr,
+            id,
+            cancel,
+            task,
+        });
+        // The GUI must know the paste is active before the pending offer is
+        // cleared, so its native marker survives until transfer completion.
+        let initial = FilePasteProgress {
+            id,
+            received: 0,
+            total,
+            phase: FilePastePhase::Receiving,
+            message: None,
+        };
+        self.file_paste_progress(initial);
+        self.notify_file_offer();
+    }
+
+    fn file_paste_progress(&mut self, progress: FilePasteProgress) {
+        if self
+            .active_paste
+            .as_ref()
+            .is_none_or(|paste| paste.id != progress.id)
+        {
+            return;
+        }
+        if matches!(
+            progress.phase,
+            FilePastePhase::Complete | FilePastePhase::Failed | FilePastePhase::Cancelled
+        ) {
+            self.active_paste.take();
+        }
+        self.last_file_progress = Some(progress.clone());
+        self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
     }
 
     async fn retry_pending_clipboards(&mut self) {
@@ -1207,6 +1551,9 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::InputForwarding(forwarding) => {
+                self.notify_frontend(FrontendEvent::InputForwarding(forwarding))
+            }
             ICaptureEvent::CaptureBegin { handle, handover } => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
@@ -1376,6 +1723,13 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        self.notify_frontend(FrontendEvent::InputForwarding(self.capture.is_forwarding()));
+        self.notify_file_offer();
+        if self.file_offer.is_none() {
+            if let Some(progress) = self.last_file_progress.clone() {
+                self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
+            }
+        }
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
@@ -1596,6 +1950,7 @@ impl Service {
     }
 
     async fn remove_client(&mut self, handle: ClientHandle) {
+        self.file_senders.remove(&handle);
         self.pending_clipboards.remove(&handle);
         // Retire the exact outbound DTLS generation before Slab can reuse this
         // numeric handle for a different configured peer. The remote side

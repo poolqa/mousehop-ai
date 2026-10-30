@@ -1233,7 +1233,10 @@ fn create_event_tap<'a>(
         // forwarded pointer delta or snap the hidden cursor to the
         // edge again. The shared tag is the contract between the
         // daemon and this tap.
-        if is_mousehop_keep_awake_event(cg_ev) {
+        if is_mousehop_keep_awake_event(cg_ev)
+            || cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                == input_event::MACOS_INPUT_EVENT_TAG
+        {
             return CallbackResult::Keep;
         }
 
