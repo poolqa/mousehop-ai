@@ -1,0 +1,13 @@
+[package]
+name = "mousehop-logging"
+version.workspace = true
+edition = "2021"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+description = "Shared file logging and seven-day retention for Mousehop processes"
+
+[dependencies]
+env_logger = "0.11.3"
+log = "0.4.20"
+tempfile = "3.25.0"
+time = { version = "0.3.47", features = ["parsing"] }

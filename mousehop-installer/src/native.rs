@@ -374,7 +374,7 @@ fn wait_service(service: &ServiceHandle, expected: SERVICE_STATUS_CURRENT_STATE)
         }
         if expected == SERVICE_RUNNING && state.dwCurrentState == SERVICE_STOPPED {
             return Err(invalid(format!(
-                "Service stopped during startup (Windows error {}); see ProgramData\\Mousehop\\service.log",
+                "Service stopped during startup (Windows error {}); see dated logs in ProgramData\\Mousehop",
                 state.dwWin32ExitCode
             )));
         }
@@ -454,7 +454,10 @@ fn terminate(process: &Process) -> io::Result<()> {
     Ok(())
 }
 fn stop_installed_processes(layout: &Layout) -> io::Result<()> {
-    let expected = executable_key(&layout.exe);
+    let expected: Vec<_> = ["mousehop.exe", "mousehop-ui.exe", "mousehop-cli.exe"]
+        .iter()
+        .map(|name| executable_key(&layout.install.join(name)))
+        .collect();
     unsafe {
         let snapshot = Handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?);
         let mut entry = PROCESSENTRY32W {
@@ -472,11 +475,17 @@ fn stop_installed_processes(layout: &Layout) -> io::Result<()> {
                 .iter()
                 .position(|c| *c == 0)
                 .unwrap_or(entry.szExeFile.len());
-            if String::from_utf16_lossy(&entry.szExeFile[..len])
-                .eq_ignore_ascii_case("mousehop.exe")
+            if ["mousehop.exe", "mousehop-ui.exe", "mousehop-cli.exe"]
+                .iter()
+                .any(|name| {
+                    String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(name)
+                })
             {
                 if let Ok(process) = process(entry.th32ProcessID) {
-                    if same_executable(&executable_key(&process.path), &expected) {
+                    if expected
+                        .iter()
+                        .any(|path| same_executable(&executable_key(&process.path), path))
+                    {
                         terminate(&process)?;
                     }
                 }
@@ -780,7 +789,21 @@ pub fn run() -> io::Result<()> {
     let action = args
         .next()
         .ok_or_else(|| invalid("Usage: mousehop-installer Prepare|Install|Uninstall [--silent]"))?;
-    let remaining: Vec<_> = args.collect();
+    let mut remaining: Vec<_> = args.collect();
+    let manifest = if action == "Install" {
+        let index = remaining
+            .iter()
+            .position(|arg| arg == "--manifest")
+            .ok_or_else(|| invalid("Install requires --manifest PATH"))?;
+        if index + 1 >= remaining.len() {
+            return Err(invalid("Missing manifest path"));
+        }
+        let path = PathBuf::from(remaining.remove(index + 1));
+        remaining.remove(index);
+        Some(path)
+    } else {
+        None
+    };
     if remaining
         .iter()
         .any(|arg| arg != "--silent" && !(action == "Install" && arg == "--allow-public"))
@@ -810,6 +833,9 @@ pub fn run() -> io::Result<()> {
             if !layout.exe.is_file() {
                 return Err(invalid("Missing installed mousehop.exe"));
             }
+            let hashes = fs::read_to_string(manifest.as_ref().expect("Install manifest checked"))?;
+            mousehop_installer::verify_payload(&layout.install, &hashes)?;
+            println!("Installed executable and DLL SHA-256 hashes match this installer");
             install_service(&manager, &layout, allow_public)?;
         }
         "Uninstall" => {

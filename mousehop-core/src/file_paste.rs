@@ -10,6 +10,12 @@ use std::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+mod publication;
+
+pub(crate) struct PendingFileConflict {
+    pub question: mousehop_ipc::FilePasteConflict,
+    pub reply: std::sync::mpsc::Sender<mousehop_ipc::FilePasteConflictAction>,
+}
 
 pub(crate) struct RemoteFileOffer {
     pub addr: SocketAddr,
@@ -37,6 +43,7 @@ pub(crate) struct ActivePaste {
     pub id: [u8; 16],
     pub cancel: CancellationToken,
     pub task: tokio::task::JoinHandle<()>,
+    pub conflict: Option<PendingFileConflict>,
 }
 
 impl Drop for ActivePaste {
@@ -51,6 +58,7 @@ pub(crate) async fn paste(
     destination: PathBuf,
     cancel: CancellationToken,
     tx: UnboundedSender<FilePasteProgress>,
+    conflicts: UnboundedSender<PendingFileConflict>,
 ) {
     let id = offer.stream.offer.transfer_id.0;
     let total = offer.stream.offer.total_bytes;
@@ -80,32 +88,42 @@ pub(crate) async fn paste(
         })
         .await
         .map_err(io::Error::other)??;
-        let staged = receive_stream_with_progress(
-            offer.addr,
-            offer.stream,
-            TransferLimits::default(),
-            |received| report(received, FilePastePhase::Receiving, None),
-        )
-        .await
-        .map_err(io::Error::other)?;
+        let staged = tokio::select! {
+            result = receive_stream_with_progress(
+                offer.addr, offer.stream, TransferLimits::default(),
+                |received| report(received, FilePastePhase::Receiving, None),
+            ) => result.map_err(io::Error::other)?,
+            _ = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "File paste cancelled")),
+        };
         if input_capture::clipboard::native_clipboard_version() != offer.clipboard_version {
             return Err(io::Error::other("Clipboard changed; copy the files again"));
         }
         report(total, FilePastePhase::Saving, None);
-        tokio::task::spawn_blocking(move || publish(staged, &destination, &cancel))
-            .await
-            .map_err(io::Error::other)??;
+        tokio::task::spawn_blocking(move || {
+            let context = publication::ConflictContext { id, tx: conflicts };
+            publication::publish(staged, &destination, &cancel, Some(&context))
+        })
+        .await
+        .map_err(io::Error::other)??;
         Ok::<_, io::Error>(())
     }
     .await;
     match result {
         Ok(()) => report(total, FilePastePhase::Complete, None),
-        Err(error) => report(0, FilePastePhase::Failed, Some(error.to_string())),
+        Err(error) => report(
+            0,
+            if error.kind() == io::ErrorKind::Interrupted {
+                FilePastePhase::Cancelled
+            } else {
+                FilePastePhase::Failed
+            },
+            Some(error.to_string()),
+        ),
     }
 }
 
-/// Only remove paths this operation created. Never merge into an existing
-/// directory, replace a file, or recursively delete another application's data.
+/// Only remove paths this operation created. Approved replacements are held
+/// separately by the publication transaction until the entire paste succeeds.
 #[derive(Default)]
 struct CreatedPaths(Vec<(PathBuf, bool)>);
 impl Drop for CreatedPaths {
@@ -131,42 +149,13 @@ fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn publish(
     staged: StagedClipboard,
     destination: &Path,
     cancel: &CancellationToken,
 ) -> io::Result<()> {
-    let StagedClipboard::FileTree {
-        _staging,
-        _roots: roots,
-    } = staged
-    else {
-        return Err(io::Error::other("Only file offers can be pasted"));
-    };
-    #[cfg(windows)]
-    let _access = crate::windows_service::desktop_file_access()?;
-    // Fail before copying anything if any top-level name already exists.
-    for root in &roots {
-        let name = root
-            .file_name()
-            .ok_or_else(|| io::Error::other("Invalid filename"))?;
-        if fs::symlink_metadata(destination.join(name)).is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} already exists", name.to_string_lossy()),
-            ));
-        }
-    }
-    let mut created = CreatedPaths::default();
-    for root in roots {
-        let name = root
-            .file_name()
-            .ok_or_else(|| io::Error::other("Invalid filename"))?;
-        copy_new(&root, &destination.join(name), cancel, &mut created)?;
-    }
-    check_cancel(cancel)?;
-    created.0.clear();
-    Ok(())
+    publication::publish(staged, destination, cancel, None)
 }
 
 fn copy_new(
@@ -228,7 +217,7 @@ mod tests {
     use super::*;
     use crate::clipboard_bulk::{OutgoingPayload, OutgoingTransfer};
 
-    fn staged(files: &[(&str, &[u8])]) -> StagedClipboard {
+    pub(super) fn staged(files: &[(&str, &[u8])]) -> StagedClipboard {
         let staging = tempfile::tempdir().unwrap();
         let mut roots = Vec::new();
         for (name, contents) in files {
@@ -298,7 +287,12 @@ mod tests {
         let transfer = OutgoingTransfer::bind(
             "127.0.0.1".parse().unwrap(),
             "source".into(),
-            OutgoingPayload::file_tree(vec![folder], None).unwrap(),
+            OutgoingPayload::file_tree(
+                vec![folder],
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -334,6 +328,7 @@ mod tests {
             destination.path().into(),
             CancellationToken::new(),
             tx,
+            tokio::sync::mpsc::unbounded_channel().0,
         )
         .await;
         sender.await.unwrap().unwrap();

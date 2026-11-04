@@ -6,6 +6,10 @@
 //! in-layout cursor coordinate, so the right and bottom edges use the final
 //! contained coordinate rather than the exclusive rectangle end.
 
+/// Small spatial landing margin prevents a tiny reversal from immediately
+/// handing the pointer back across the edge it just entered.
+pub const HANDOVER_LANDING_INSET: u32 = 8;
+
 /// A side of a logical display layout.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DisplayEdge {
@@ -424,6 +428,35 @@ impl DisplayLayout {
         };
         self.project_point(edge, desired)
     }
+
+    /// Move a projected edge point into its containing display, preserving the
+    /// cross axis and never overshooting a narrow display or entering a gap.
+    pub fn inset_landing(&self, edge: DisplayEdge, point: (i32, i32)) -> Option<(i32, i32)> {
+        let rect = self
+            .rectangles()
+            .map(|(_, rect)| rect)
+            .find(|rect| rect.contains(point))?;
+        let distance = match edge {
+            DisplayEdge::Left | DisplayEdge::Right => {
+                HANDOVER_LANDING_INSET.min((rect.width() - 1) / 2)
+            }
+            DisplayEdge::Top | DisplayEdge::Bottom => {
+                HANDOVER_LANDING_INSET.min((rect.height() - 1) / 2)
+            }
+        } as i32;
+        Some(match edge {
+            DisplayEdge::Left => (
+                point.0.saturating_add(distance).min(rect.right() - 1),
+                point.1,
+            ),
+            DisplayEdge::Right => (point.0.saturating_sub(distance).max(rect.x()), point.1),
+            DisplayEdge::Top => (
+                point.0,
+                point.1.saturating_add(distance).min(rect.bottom() - 1),
+            ),
+            DisplayEdge::Bottom => (point.0, point.1.saturating_sub(distance).max(rect.y())),
+        })
+    }
 }
 
 fn nearest_segment(segments: &[EdgeSegment], desired: i32) -> Option<(EdgeSegment, i32)> {
@@ -446,6 +479,41 @@ fn nearest_segment(segments: &[EdgeSegment], desired: i32) -> Option<(EdgeSegmen
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn landing_margin_preserves_height_and_prevents_a_one_pixel_bounce() {
+        let mac = super::DisplayLayout::new([(0, 0, 1920, 1080)]);
+        let landing = mac
+            .inset_landing(super::DisplayEdge::Left, (0, 400))
+            .unwrap();
+        assert_eq!(landing, (8, 400));
+        assert!(landing.0 - 1 > 0);
+        assert_eq!(
+            mac.inset_landing(super::DisplayEdge::Right, (1919, 400)),
+            Some((1911, 400))
+        );
+    }
+
+    #[test]
+    fn inset_landing_handles_stepped_negative_origins_and_tiny_outputs() {
+        use super::{DisplayEdge, DisplayLayout};
+        let layout = DisplayLayout::new([(-1920, 0, 1920, 1080), (0, 200, 1920, 1080)]);
+        assert_eq!(
+            layout.inset_landing(
+                DisplayEdge::Left,
+                layout.project_fraction(DisplayEdge::Left, 0.95).unwrap()
+            ),
+            Some((8, 1216))
+        );
+        let tiny = DisplayLayout::new([(-10, -10, 3, 3)]);
+        assert_eq!(
+            tiny.inset_landing(DisplayEdge::Left, (-10, -9)),
+            Some((-9, -9))
+        );
+        assert_eq!(
+            tiny.inset_landing(DisplayEdge::Bottom, (-9, -8)),
+            Some((-9, -9))
+        );
+    }
     use super::{DisplayEdge, DisplayLayout, DisplayRect, EdgeSegment};
 
     const LINUX_RECTS: [(i32, i32, u32, u32); 3] = [

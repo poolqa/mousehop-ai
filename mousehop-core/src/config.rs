@@ -15,7 +15,6 @@ use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
 
-use mousehop_cli::CliArgs;
 use mousehop_ipc::{
     ClipboardSuppression, ConnectionMode, CrossingModifier, DEFAULT_PORT, IncomingPeerConfig,
     Position,
@@ -185,7 +184,14 @@ pub enum Command {
     /// test input capture
     TestCapture(TestCaptureArgs),
     /// Mousehop commandline interface
-    Cli(CliArgs),
+    Cli {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run the background desktop agent without opening settings.
+    Agent,
+    /// Open preferences, starting the background agent if needed.
+    Settings,
     /// run in daemon mode
     Daemon,
     /// Internal LocalSystem desktop worker (launched by the Windows service).
@@ -871,6 +877,22 @@ mod connection_mode_tests {
                 .expect("serialize config");
         let reloaded: ConfigToml = toml::from_str(&serialized).expect("reload config");
         assert_eq!(reloaded.clients, None);
+    }
+
+    #[tokio::test]
+    async fn release_threshold_updates_persist_instead_of_reverting_to_thirty() {
+        let root = tempfile::tempdir().expect("temporary config");
+        let mut config = config_with_no_clients();
+        config.config_dir = root.path().to_owned();
+        config.config_path = root.path().join("config.toml");
+        for value in [30, 80, 0, 120] {
+            config.set_release_threshold_px(value);
+            config.write_back().await.expect("save threshold");
+            let reloaded = ConfigToml::new(config.config_path()).expect("reload threshold");
+            assert_eq!(reloaded.release_threshold_px, Some(value));
+            config.read_from_disk().expect("refresh config");
+            assert_eq!(config.release_threshold_px(), value);
+        }
     }
 
     #[test]

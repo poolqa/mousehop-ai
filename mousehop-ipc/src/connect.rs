@@ -13,10 +13,6 @@ use std::path::Path;
 
 #[cfg(windows)]
 use crate::windows::PipeStream;
-#[cfg(windows)]
-use std::fs::OpenOptions;
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
 
 #[cfg(unix)]
 type FrontendStream = UnixStream;
@@ -48,8 +44,12 @@ impl FrontendEventReader {
 
 impl FrontendRequestWriter {
     pub fn request(&mut self, request: FrontendRequest) -> Result<(), io::Error> {
+        #[cfg(windows)]
+        if crate::windows::route_admin_request(&request)? {
+            return Ok(());
+        }
         let mut json = serde_json::to_string(&request).unwrap();
-        log::debug!("requesting: {json}");
+        log::trace!("sending frontend request");
         json.push('\n');
         self.line_writer.write_all(json.as_bytes())?;
         Ok(())
@@ -98,7 +98,10 @@ fn frontend_connection(
     let lines = buf_reader.lines();
     let line_writer = LineWriter::new(tx);
     let reader = FrontendEventReader { lines };
-    let writer = FrontendRequestWriter { line_writer };
+    let mut writer = FrontendRequestWriter { line_writer };
+    writer.request(FrontendRequest::Hello {
+        version: crate::LOCAL_PROTOCOL_VERSION,
+    })?;
     Ok((reader, writer))
 }
 
@@ -132,7 +135,7 @@ fn wait_for_service() -> Result<PipeStream, ConnectionError> {
         }
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(io::Error::new(io::ErrorKind::TimedOut,
-                "Mousehop input worker did not become ready within 30 seconds. See C:\\ProgramData\\Mousehop\\service.log and panic.log from an administrator terminal.").into());
+                "Mousehop input worker did not become ready within 30 seconds. See the dated log files in C:\\ProgramData\\Mousehop from an administrator terminal.").into());
         }
         thread::sleep(exponential_back_off(&mut duration));
     }
@@ -145,15 +148,7 @@ fn connect_to_path(socket_path: &Path) -> Result<UnixStream, ConnectionError> {
 
 #[cfg(windows)]
 fn connect_to_service() -> Result<PipeStream, ConnectionError> {
-    // SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION: never lend our
-    // elevated token to a pipe server through impersonation.
-    let stream = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(0x0010_0000 | 0x0001_0000 | 0x4000_0000)
-        .open(crate::windows::pipe_name()?)?;
-    crate::windows::verify_server(&stream)?;
-    Ok(PipeStream(stream))
+    Ok(PipeStream(crate::windows::open_client()?))
 }
 
 fn exponential_back_off(duration: &mut Duration) -> Duration {

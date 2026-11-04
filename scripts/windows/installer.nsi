@@ -21,7 +21,7 @@ VIAddVersionKey "LegalCopyright" "Mousehop contributors (GPL-3.0-or-later)"
 !insertmacro MUI_PAGE_LICENSE "../../LICENSE"
 Page custom NetworkOptionsPage NetworkOptionsLeave
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_TEXT "Mousehop is installed as a Windows service.$\r$\n$\r$\nOpen Mousehop Settings from Start and approve administrator consent to pair trusted devices. Service pairing is separate from portable installations.$\r$\n$\r$\nTrusted peers can control the console login, lock and UAC desktops. Closing Settings does not stop sharing."
+!define MUI_FINISHPAGE_TEXT "Mousehop is installed as a Windows service.$\r$\n$\r$\nMousehop runs in the notification area after sign-in. Open Settings to pair trusted devices; machine changes request administrator consent. Service pairing is separate from portable installations.$\r$\n$\r$\nTrusted peers can control the console login, lock and UAC desktops. Closing Settings does not stop sharing."
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
@@ -36,6 +36,7 @@ Page custom NetworkOptionsPage NetworkOptionsLeave
         StrCpy $0 ""
     ${EndIf}
     ${If} "${Action}" == "Install"
+        StrCpy $0 '$0 --manifest "$PLUGINSDIR\payload.sha256"'
         ${If} $AllowPublic == 1
             StrCpy $0 "$0 --allow-public"
         ${EndIf}
@@ -94,10 +95,13 @@ Section "Mousehop"
     InitPluginsDir
     SetOutPath "$PLUGINSDIR"
     File /oname=mousehop-installer.exe "${INSTALLER_HELPER}"
+    File /oname=payload.sha256 "${PAYLOAD}/payload.sha256"
     !insertmacro ServiceAction Prepare
     SetOutPath "$INSTDIR"
     ClearErrors
     File "${PAYLOAD}/mousehop.exe"
+    File "${PAYLOAD}/mousehop-ui.exe"
+    File "${PAYLOAD}/mousehop-cli.exe"
     File "${PAYLOAD}/*.dll"
     File /oname=LICENSE.txt "../../LICENSE"
     FileOpen $0 "$INSTDIR\service-mode" w
@@ -117,7 +121,9 @@ Section "Mousehop"
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Mousehop" "NoModify" 1
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Mousehop" "NoRepair" 1
     CreateDirectory "$SMPROGRAMS\Mousehop"
-    CreateShortcut "$SMPROGRAMS\Mousehop\Mousehop Settings.lnk" "$INSTDIR\mousehop.exe"
+    CreateShortcut "$SMPROGRAMS\Mousehop\Mousehop.lnk" "$INSTDIR\mousehop.exe"
+    CreateShortcut "$SMPROGRAMS\Mousehop\Mousehop Settings.lnk" "$INSTDIR\mousehop.exe" "settings"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "Mousehop" '$\"$INSTDIR\mousehop.exe$\" agent'
     CreateShortcut "$SMPROGRAMS\Mousehop\Uninstall Mousehop.lnk" "$INSTDIR\uninstall.exe"
     !insertmacro ServiceAction Install
     WriteRegDWORD HKLM "Software\Mousehop\Installer" "AllowPublicNetwork" $AllowPublic
@@ -135,11 +141,15 @@ Section "Uninstall"
     File /oname=mousehop-installer.exe "${INSTALLER_HELPER}"
     !insertmacro ServiceAction Uninstall
     Delete "$INSTDIR\mousehop.exe"
+    Delete "$INSTDIR\mousehop-ui.exe"
+    Delete "$INSTDIR\mousehop-cli.exe"
     Delete "$INSTDIR\*.dll"
     Delete "$INSTDIR\service-mode"
     Delete "$INSTDIR\LICENSE.txt"
     Delete "$INSTDIR\uninstall.exe"
     RMDir "$INSTDIR"
+    DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "Mousehop"
+    Delete "$SMPROGRAMS\Mousehop\Mousehop.lnk"
     Delete "$SMPROGRAMS\Mousehop\Mousehop Settings.lnk"
     Delete "$SMPROGRAMS\Mousehop\Uninstall Mousehop.lnk"
     RMDir "$SMPROGRAMS\Mousehop"

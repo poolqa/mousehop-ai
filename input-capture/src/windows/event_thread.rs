@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
@@ -21,14 +22,15 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER,
-    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME,
+    GUI_INMENUMODE, GUI_INMOVESIZE, GUI_POPUPMENUMODE, GUI_SYSTEMMENUMODE, GUITHREADINFO,
+    GetGUIThreadInfo, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SetTimer,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_WTSSESSION_CHANGE,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use input_event::{
@@ -43,62 +45,96 @@ pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
+    stopping: Arc<AtomicBool>,
 }
 
 impl EventThread {
     pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer), stopping.clone());
         Self {
             request_buffer,
             thread: Some(thread),
             thread_id,
+            stopping,
         }
     }
 
     pub(crate) async fn release_capture(&self) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.client_update(ClientUpdate::Release(tx));
+        if let Err(error) = self.client_update(ClientUpdate::Release(tx)) {
+            log::warn!("Cannot release Windows capture: {error}");
+            return false;
+        }
         matches!(
             tokio::time::timeout(std::time::Duration::from_secs(1), rx).await,
             Ok(Ok(()))
         )
     }
 
-    pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+    pub(crate) fn create(&self, pos: Position) -> io::Result<()> {
+        self.client_update(ClientUpdate::Create(pos))
     }
 
-    pub(crate) fn destroy(&self, pos: Position) {
-        self.client_update(ClientUpdate::Destroy(pos));
+    pub(crate) fn destroy(&self, pos: Position) -> io::Result<()> {
+        self.client_update(ClientUpdate::Destroy(pos))
     }
 
-    pub(crate) fn set_crossing_modifier(&self, pos: Position, modifier: Option<CrossingModifier>) {
-        self.client_update(ClientUpdate::SetCrossingModifier(pos, modifier));
+    pub(crate) fn set_crossing_modifier(
+        &self,
+        pos: Position,
+        modifier: Option<CrossingModifier>,
+    ) -> io::Result<()> {
+        self.client_update(ClientUpdate::SetCrossingModifier(pos, modifier))
     }
 
     fn exit(&self) {
-        self.signal(RequestType::Exit);
+        self.stopping.store(true, Ordering::SeqCst);
+        if let Err(error) = self.signal(RequestType::Exit) {
+            log::debug!("Windows capture thread already stopped or unavailable: {error}");
+        }
     }
 
-    fn client_update(&self, request: ClientUpdate) {
+    fn client_update(&self, request: ClientUpdate) -> io::Result<()> {
         {
             let mut requests = self.request_buffer.lock().unwrap();
             requests.push(request);
         }
-        self.signal(RequestType::ClientUpdate);
+        if let Err(error) = self.signal(RequestType::ClientUpdate) {
+            // Drop outstanding release senders too; their callers must not
+            // wait for acknowledgements from a thread which cannot be reached.
+            self.request_buffer.lock().unwrap().clear();
+            return Err(error);
+        }
+        Ok(())
     }
 
-    fn signal(&self, event_type: RequestType) {
+    fn signal(&self, event_type: RequestType) -> io::Result<()> {
+        if self
+            .thread
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Windows capture event thread has exited",
+            ));
+        }
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) }
+            .map_err(io::Error::from)
     }
 }
 
 impl Drop for EventThread {
     fn drop(&mut self) {
         self.exit();
-        let _ = self.thread.take().expect("thread").join();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                log::error!("Windows capture event thread panicked");
+            }
+        }
     }
 }
 
@@ -127,6 +163,7 @@ fn try_send_event(
 }
 
 thread_local! {
+    static HOST_KEY_ROUTING: RefCell<crate::windows_keyboard::HostKeyRouting> = RefCell::new(Default::default());
     /// all configured clients
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
     /// currently active client
@@ -174,7 +211,13 @@ fn get_msg() -> Option<MSG> {
         match ret.0 {
             0 => None,
             x if x > 0 => Some(msg),
-            _ => panic!("error in GetMessageW"),
+            _ => {
+                log::error!(
+                    "Windows capture message loop failed: {}",
+                    io::Error::last_os_error()
+                );
+                None
+            }
         }
     }
 }
@@ -182,12 +225,14 @@ fn get_msg() -> Option<MSG> {
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    stopping: Arc<AtomicBool>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
     let thread_id_ = Arc::clone(&thread_id);
 
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer));
+    let msg_thread =
+        thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer, stopping));
 
     /* wait for thread to set its id */
     let (cond, thread_id) = &*thread_id;
@@ -202,19 +247,14 @@ fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    stopping: Arc<AtomicBool>,
 ) {
+    publish_ready(&ready);
     // A Winlogon helper starts after the lock notification was already sent.
     // Initialize from its assigned desktop rather than waiting for another lock.
     DESKTOP_SECURE.set(desktop_is_secure());
     HOST_LOCKED.set(DESKTOP_SECURE.get());
     EVENT_TX.replace(Some(event_tx));
-    /* communicate thread id */
-    {
-        let (cnd, mtx) = &*ready;
-        let mut ready = mtx.lock().unwrap();
-        *ready = Some(unsafe { GetCurrentThreadId() });
-        cnd.notify_one();
-    }
 
     let window_proc: WNDPROC = Some(window_proc);
 
@@ -305,7 +345,10 @@ fn start_routine(
     /* run message loop. mouse / keybrd procs don't actually return
      * a message, so `get_msg() == None` ends the loop; an Exit-typed
      * thread message breaks out from inside the body. */
-    while let Some(msg) = get_msg() {
+    while !stopping.load(Ordering::SeqCst) {
+        let Some(msg) = get_msg() else {
+            break;
+        };
         if msg.hwnd.0.is_null() {
             /* messages sent via PostThreadMessage */
             match msg.wParam.0 {
@@ -342,6 +385,18 @@ fn start_routine(
         let _ = WTSUnRegisterSessionNotification(msg_window);
     }
     uninstall_hooks();
+}
+
+fn publish_ready(ready: &(Condvar, Mutex<Option<u32>>)) {
+    // PostThreadMessage fails with ERROR_INVALID_THREAD_ID before the target
+    // has a message queue, even when the thread itself is already running.
+    let mut msg = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+    }
+    let (condition, id) = ready;
+    *id.lock().unwrap() = Some(unsafe { GetCurrentThreadId() });
+    condition.notify_one();
 }
 
 /// Install the `WH_MOUSE_LL` / `WH_KEYBOARD_LL` hooks and stash
@@ -392,7 +447,7 @@ fn hook_watchdog_tick() {
     }
 }
 
-fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
+fn check_client_activation(wparam: WPARAM, lparam: LPARAM, returning_injected_input: bool) -> bool {
     if wparam.0 != WM_MOUSEMOVE as usize {
         return ACTIVE_CLIENT.get().is_some();
     }
@@ -432,11 +487,20 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
-    if CROSSING_MODIFIERS.with_borrow(|modifiers| {
-        modifiers
-            .get(&pos)
-            .is_some_and(|modifier| !host_modifier_held(*modifier))
-    }) {
+    if !returning_injected_input
+        && CROSSING_MODIFIERS.with_borrow(|modifiers| {
+            modifiers
+                .get(&pos)
+                .is_some_and(|modifier| !host_modifier_held(*modifier))
+        })
+    {
+        return ret;
+    }
+
+    // A local click/drag or shell popup must retain pointer ownership until
+    // its gesture ends. Splitting down/up across machines leaves Windows in
+    // a drag/menu state and can swallow subsequent clicks.
+    if host_interaction_active() {
         return ret;
     }
 
@@ -456,14 +520,20 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * be far worse than a logged drop. */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
+    let normalized_cursor = DISPLAYS.with_borrow(|(displays, _)| {
+        crate::normalize_cursor_in_layout(&display_util::layout(displays), entry_point)
+    });
     if let Err(e) = try_send_event(
         active,
         CaptureEvent::Begin {
-            cursor: None,
-            normalized_cursor: None,
+            cursor: Some(entry_point),
+            normalized_cursor,
         },
     ) {
         log::error!("forwarding channel full — dropped capture-begin event: {e}");
+        // Core cannot release a capture whose Begin it never received.
+        ACTIVE_CLIENT.take();
+        return ret;
     }
     for event in host_modifier_snapshot() {
         if let Err(e) = try_send_event(active, event) {
@@ -474,6 +544,30 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     ret
 }
 
+fn host_interaction_active() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
+    if [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .iter()
+        .any(|button| unsafe { GetAsyncKeyState(button.0 as i32) < 0 })
+    {
+        return true;
+    }
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(0, &mut gui) }.is_err() {
+        // Foreground transitions can make this snapshot unavailable. Defer
+        // this crossing rather than stealing a menu we cannot inspect.
+        return true;
+    }
+    gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0 | GUI_SYSTEMMENUMODE.0 | GUI_INMOVESIZE.0)
+        != 0
+        || !gui.hwndCapture.0.is_null()
+}
+
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode < 0 {
         return CallNextHookEx(None, ncode, wparam, lparam);
@@ -482,15 +576,21 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     if mouse.flags & windows::Win32::UI::WindowsAndMessaging::LLMHF_INJECTED != 0
         || mouse.dwExtraInfo == input_event::WINDOWS_INPUT_EVENT_TAG
     {
-        // Injected movement must neither cross a barrier nor become physical
-        // motion relative to an old position when the next real event arrives.
+        // Observe our relative injection for a native return-edge Begin, but
+        // never capture/forward the injected input itself (no feedback loop).
+        // Absolute landing/warps and other programs' injection remain ignored.
         if wparam.0 == WM_MOUSEMOVE as usize {
-            PREV_POS.set(Some((mouse.pt.x, mouse.pt.y)));
+            if crate::windows_pointer::observe_injected_motion(true, mouse.dwExtraInfo, true) {
+                HOOK_FIRED.store(true, Ordering::Relaxed);
+                check_client_activation(wparam, lparam, true);
+            } else {
+                PREV_POS.set(Some((mouse.pt.x, mouse.pt.y)));
+            }
         }
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
     HOOK_FIRED.store(true, Ordering::Relaxed);
-    let active = check_client_activation(wparam, lparam);
+    let active = check_client_activation(wparam, lparam, false);
 
     /* no client was active */
     if !active {
@@ -506,6 +606,10 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(pointer_event) = to_mouse_event(wparam, lparam) else {
         return LRESULT(1);
     };
+
+    if matches!(pointer_event, PointerEvent::Button { .. }) {
+        send_host_modifier_state(pos);
+    }
 
     /* notify mainthread (drop events if sending too fast) */
     if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
@@ -533,15 +637,31 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(key_event) = to_key_event(wparam, lparam) else {
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
-    update_host_modifier_state(&key_event);
+    let modifier_changed = update_host_modifier_state(&key_event);
+    let active = ACTIVE_CLIENT.get();
+    let pass_to_host = if let KeyboardEvent::Key { key, state, .. } = key_event {
+        HOST_KEY_ROUTING
+            .with_borrow_mut(|routing| routing.pass_to_host(key, state, active.is_some()))
+    } else {
+        active.is_none()
+    };
 
     /* get active client if any */
-    let Some(client) = ACTIVE_CLIENT.get() else {
+    let Some(client) = active else {
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
         log::warn!("e: {e}");
+    }
+
+    if modifier_changed {
+        send_host_modifier_state(client);
+    }
+    // A modifier pressed before crossing already reached Windows. Its release
+    // must reach both Windows and the peer, even while new keys are captured.
+    if pass_to_host {
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */
@@ -584,12 +704,12 @@ unsafe extern "system" fn window_proc(
     LRESULT(1)
 }
 
-fn update_host_modifier_state(event: &KeyboardEvent) {
+fn update_host_modifier_state(event: &KeyboardEvent) -> bool {
     let KeyboardEvent::Key { key, state, .. } = event else {
-        return;
+        return false;
     };
     let Ok(key) = Linux::try_from(*key) else {
-        return;
+        return false;
     };
     if !matches!(
         key,
@@ -602,7 +722,7 @@ fn update_host_modifier_state(event: &KeyboardEvent) {
             | Linux::KeyLeftMeta
             | Linux::KeyRightmeta
     ) {
-        return;
+        return false;
     }
     HOST_MODIFIERS.with_borrow_mut(|pressed| {
         if *state == 0 {
@@ -611,6 +731,16 @@ fn update_host_modifier_state(event: &KeyboardEvent) {
             pressed.insert(key);
         }
     });
+    true
+}
+
+fn send_host_modifier_state(client: Position) {
+    // The final event is the aggregate mask, not another set of key-downs.
+    if let Some(snapshot) = host_modifier_snapshot().pop() {
+        if let Err(error) = try_send_event(client, snapshot) {
+            log::warn!("Cannot forward modifier snapshot: {error}");
+        }
+    }
 }
 
 fn host_modifier_snapshot() -> Vec<CaptureEvent> {
@@ -902,5 +1032,70 @@ fn desktop_is_secure() -> bool {
         }
         let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
         !String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("default")
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn ready_thread_already_has_a_message_queue() {
+        let ready = Arc::new((Condvar::new(), Mutex::new(None)));
+        let thread_ready = ready.clone();
+        let worker = thread::spawn(move || {
+            publish_ready(&thread_ready);
+            let message = get_msg().expect("posted exit message");
+            assert_eq!(message.wParam.0, RequestType::Exit as usize);
+        });
+        let (condition, id) = &*ready;
+        let (id, timeout) = condition
+            .wait_timeout_while(id.lock().unwrap(), Duration::from_secs(2), |id| {
+                id.is_none()
+            })
+            .unwrap();
+        assert!(!timeout.timed_out(), "message queue readiness timed out");
+        unsafe {
+            PostThreadMessageW(
+                id.expect("ready thread"),
+                WM_USER,
+                WPARAM(RequestType::Exit as usize),
+                LPARAM(0),
+            )
+        }
+        .expect("ready thread must accept a message immediately");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn updates_and_drop_after_thread_exit_do_not_panic() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            sender.send(unsafe { GetCurrentThreadId() }).unwrap();
+        });
+        let id = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        while !worker.is_finished() {
+            thread::yield_now();
+        }
+        let event_thread = EventThread {
+            request_buffer: Default::default(),
+            thread: Some(worker),
+            thread_id: id,
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(event_thread.create(Position::Left).is_err());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            event_thread
+                .client_update(ClientUpdate::Release(sender))
+                .is_err()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(event_thread.request_buffer.lock().unwrap().is_empty());
+        drop(event_thread);
     }
 }

@@ -735,16 +735,12 @@ impl InputCaptureState {
                 // *removed* the entry from System Settings → Privacy
                 // & Security → Accessibility (vs just toggling it
                 // off — removal can leave AXIsProcessTrusted reporting
-                // cached-true in already-running processes). Exit
-                // the daemon process directly: the GUI will see its
-                // IPC connection drop and trigger its own
-                // quit-with-backstop path. This is the only reliable
-                // way to tear down a wedged HID-level tap quickly.
-                if !unsafe { AXIsProcessTrusted() } {
-                    log::error!(
-                        "CGEventTap disabled and Accessibility no longer granted — daemon exiting"
-                    );
-                    std::process::exit(0);
+                // cached-true in already-running processes). End this
+                // backend so its tap/run loop is torn down, retaining Core
+                // and Settings so the user can repair permissions.
+                if unsafe { AXIsProcessTrusted() } == 0 {
+                    log::warn!("CGEventTap disabled and Accessibility revoked; stopping capture");
+                    return Err(CaptureError::EventTapDisabled);
                 }
                 if recovery_claim == TapRecoveryClaim::NoCapture {
                     return Err(CaptureError::EventTapDisabled);
@@ -938,6 +934,9 @@ fn get_events(
     result: &mut Vec<CaptureEvent>,
     caps_lock_remapped: bool,
 ) -> Result<(), CaptureError> {
+    if let Some(snapshot) = button_modifier_snapshot(*ev_type, ev.get_flags()) {
+        result.push(snapshot);
+    }
     fn map_pointer_event(ev: &CGEvent) -> PointerEvent {
         PointerEvent::Motion {
             time: 0,
@@ -1192,6 +1191,29 @@ fn get_events(
         _ => (),
     }
     Ok(())
+}
+
+fn button_modifier_snapshot(event: CGEventType, flags: CGEventFlags) -> Option<CaptureEvent> {
+    if !matches!(
+        event,
+        CGEventType::LeftMouseDown
+            | CGEventType::LeftMouseUp
+            | CGEventType::RightMouseDown
+            | CGEventType::RightMouseUp
+            | CGEventType::OtherMouseDown
+            | CGEventType::OtherMouseUp
+    ) {
+        return None;
+    }
+    let (depressed, locked) = modifier_masks(flags);
+    Some(CaptureEvent::Input(Event::Keyboard(
+        KeyboardEvent::Modifiers {
+            depressed: depressed.bits(),
+            latched: 0,
+            locked: locked.bits(),
+            group: 0,
+        },
+    )))
 }
 
 fn create_event_tap<'a>(
@@ -1952,6 +1974,21 @@ mod permission_tests {
     use super::*;
 
     #[test]
+    fn mouse_click_snapshots_can_repair_a_missing_modifier_release() {
+        assert!(matches!(
+            button_modifier_snapshot(CGEventType::LeftMouseDown, CGEventFlags::empty()),
+            Some(CaptureEvent::Input(Event::Keyboard(
+                KeyboardEvent::Modifiers { depressed: 0, .. }
+            )))
+        ));
+        assert!(
+            matches!(button_modifier_snapshot(CGEventType::LeftMouseDown, CGEventFlags::CGEventFlagControl),
+            Some(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers { depressed, .. }))) if depressed == XMods::ControlMask.bits())
+        );
+        assert!(button_modifier_snapshot(CGEventType::MouseMoved, CGEventFlags::empty()).is_none());
+    }
+
+    #[test]
     fn skips_input_monitoring_check_without_accessibility() {
         let input_monitoring_checked = Cell::new(false);
 
@@ -2429,7 +2466,7 @@ fn request_accessibility_permission() -> bool {
     // startup (see mousehop_gtk::macos_privacy) so retries triggered by
     // clicking the "Reenable" button don't pop a fresh Accessibility
     // alert every time.
-    unsafe { AXIsProcessTrusted() }
+    unsafe { AXIsProcessTrusted() != 0 }
 }
 
 fn request_input_monitoring_permission() -> bool {
@@ -2638,7 +2675,7 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrusted() -> std::ffi::c_uchar;
 }
 
 /// Read `com.apple.swipescrolldirection` from the global preferences

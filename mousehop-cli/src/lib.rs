@@ -19,7 +19,7 @@ pub enum CliError {
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
-#[command(name = "mousehop-cli", about = "Mousehop CLI interface")]
+#[command(name = "mousehop-cli", version, about = "Mousehop CLI interface")]
 pub struct CliArgs {
     #[command(subcommand)]
     command: CliSubcommand,
@@ -39,6 +39,14 @@ struct Client {
 
 #[derive(Clone, Subcommand, Debug, PartialEq, Eq)]
 enum CliSubcommand {
+    /// Pause all input and clipboard sharing.
+    Pause,
+    /// Resume sharing with the current configuration.
+    Resume,
+    /// Stop Mousehop (an installed service remains idle).
+    Quit,
+    /// Open preferences through the desktop agent.
+    Settings,
     /// add a new client
     AddClient(Client),
     /// remove an existing client
@@ -83,6 +91,10 @@ pub async fn run(args: CliArgs) -> Result<(), CliError> {
 async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
     let (mut rx, mut tx) = connect_async(Some(Duration::from_millis(500))).await?;
     match cmd {
+        CliSubcommand::Pause => tx.request(FrontendRequest::SetSharing(false)).await?,
+        CliSubcommand::Resume => tx.request(FrontendRequest::SetSharing(true)).await?,
+        CliSubcommand::Quit => tx.request(FrontendRequest::Quit).await?,
+        CliSubcommand::Settings => tx.request(FrontendRequest::OpenSettings).await?,
         CliSubcommand::AddClient(Client {
             hostname,
             port,

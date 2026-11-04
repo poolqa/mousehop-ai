@@ -153,3 +153,17 @@ Copy files on another computer, then use Paste in Finder or Explorer.	在另一�
 Ready from {source}: {count} items ({size}). Use Paste in Finder or Explorer.	來自 {source}：{count} 個項目（{size}）。請在 Finder 或檔案總管直接貼上。
 Copying files	正在複製檔案
 Close	關閉
+Background application	背景程式
+Sharing	共享
+Start at login	登入時啟動
+Running in the background	背景執行中
+Sharing paused	共享已暫停
+Stopped	已停止
+
+Choose how to handle the existing item.	請選擇如何處理已存在的項目。
+An item named “{name}” already exists. Replace removes the existing file or folder entirely.	已存在名為「{name}」的項目。「取代」會完整取代現有檔案或資料夾。
+File already exists	檔案已存在
+Rename incoming item	重新命名傳入項目
+Enter a new name to keep both items.	輸入新名稱，以保留兩個項目。
+Rename	改名
+Replace	取代

@@ -39,6 +39,10 @@ mod layer_shell;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_keyboard;
+#[cfg(any(windows, test))]
+mod windows_pointer;
 
 #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
 mod x11;
@@ -767,7 +771,7 @@ impl InputCapture {
                 DisplayEdge::Left | DisplayEdge::Right => ny,
                 DisplayEdge::Top | DisplayEdge::Bottom => nx,
             };
-            let global = layout.project_fraction(edge, fraction)?;
+            let global = layout.inset_landing(edge, layout.project_fraction(edge, fraction)?)?;
             let peer_origin = layout.origin()?;
             return Some((global.0 - peer_origin.0, global.1 - peer_origin.1));
         }
@@ -835,7 +839,8 @@ impl InputCapture {
             }
         }
         if let Some(layout) = self.peer_layout(pos) {
-            let point = layout.project_fraction(peer_entry_edge(pos), 0.5)?;
+            let edge = peer_entry_edge(pos);
+            let point = layout.inset_landing(edge, layout.project_fraction(edge, 0.5)?)?;
             let origin = layout.origin()?;
             return Some((
                 f64::from(point.0) - f64::from(origin.0),
@@ -898,7 +903,8 @@ impl InputCapture {
                 origin_y + host_h_i.saturating_sub(1),
             ),
         };
-        layout.project_point(display_edge(pos), rectangular_target)
+        let edge = display_edge(pos);
+        layout.inset_landing(edge, layout.project_point(edge, rectangular_target)?)
     }
 
     /// Update the wall-press accumulator from one event coming up
@@ -1459,7 +1465,7 @@ mod tests {
         ]);
         capture.set_peer_layout(Position::Bottom, 1, 1, guest);
 
-        assert_eq!(capture.virtual_cursor, Some((621.0, 0.0)));
+        assert_eq!(capture.virtual_cursor, Some((621.0, 8.0)));
     }
 
     #[test]
@@ -1554,8 +1560,8 @@ mod tests {
         capture.set_peer_layout(Position::Right, 100, 1, stepped);
         assert_eq!(
             capture.initial_virtual_cursor(Position::Right, None, None),
-            Some((1000.0, 500.0)),
-            "the midpoint follows the stepped left contour instead of empty union space",
+            Some((1008.0, 500.0)),
+            "the midpoint lands just inside the stepped left contour instead of empty union space",
         );
     }
 
@@ -1641,7 +1647,7 @@ mod tests {
         capture.set_peer_layout(Position::Right, 100, 7, retained.clone());
 
         assert_eq!(capture.peer_layout(Position::Right), Some(&retained));
-        assert_eq!(capture.virtual_cursor, Some((1000.0, 500.0)));
+        assert_eq!(capture.virtual_cursor, Some((1008.0, 500.0)));
     }
 
     #[tokio::test]

@@ -15,8 +15,23 @@ use std::ffi::c_uchar;
 unsafe extern "C" {
     // ApplicationServices declares this legacy Boolean as unsigned char.
     fn AXIsProcessTrusted() -> c_uchar;
+    fn CGPreflightListenEventAccess() -> bool;
 }
 
 pub fn is_accessibility_granted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// Check without prompting; startup uses this to expose the permission UI.
+pub fn is_input_monitoring_granted() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
+}
+
+/// Exit-status bitmask: 1 = Accessibility missing, 2 = Input Monitoring missing.
+pub fn permission_probe_status() -> i32 {
+    if !is_accessibility_granted() {
+        // Do not touch another protected API while Accessibility is missing.
+        return 3;
+    }
+    if is_input_monitoring_granted() { 0 } else { 2 }
 }

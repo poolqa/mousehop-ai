@@ -161,6 +161,9 @@ if [[ "$KIND" == "app" ]]; then
 
     # Sign the main binary explicitly before the wrapper — inside-out
     # order, so the wrapper seals an already-signed executable.
+    for helper in "$TARGET/Contents/MacOS/mousehop-ui" "$TARGET/Contents/MacOS/mousehop-cli"; do
+        codesign --force --options runtime --timestamp --keychain "$KEYCHAIN_PATH" --sign "$IDENTITY" "$helper"
+    done
     echo "==> Signing main executable"
     codesign --force --options runtime --timestamp \
         --keychain "$KEYCHAIN_PATH" \

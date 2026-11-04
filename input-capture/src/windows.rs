@@ -28,7 +28,7 @@ impl Capture for WindowsInputCapture {
         if let Some(remote) = &self.remote {
             remote.capture_create(edge(pos));
         } else if let Some(thread) = &self.event_thread {
-            thread.create(pos);
+            thread.create(pos)?;
         }
         Ok(())
     }
@@ -37,7 +37,7 @@ impl Capture for WindowsInputCapture {
         if let Some(remote) = &self.remote {
             remote.capture_destroy(edge(pos));
         } else if let Some(thread) = &self.event_thread {
-            thread.destroy(pos);
+            thread.destroy(pos)?;
         }
         Ok(())
     }
@@ -67,12 +67,16 @@ impl Capture for WindowsInputCapture {
         if let Some(remote) = &self.remote {
             remote.modifier(edge(pos), modifier);
         } else if let Some(thread) = &self.event_thread {
-            thread.set_crossing_modifier(pos, modifier);
+            thread.set_crossing_modifier(pos, modifier)?;
         }
         Ok(())
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        drop(self.event_thread.take());
+        if let Some(task) = self.remote_task.take() {
+            task.abort();
+        }
         Ok(())
     }
 }
@@ -96,9 +100,12 @@ impl WindowsInputCapture {
                     }
                     use mousehop_ipc::desktop::Capture as C;
                     let event = match event {
-                        C::Begin => CaptureEvent::Begin {
-                            cursor: None,
-                            normalized_cursor: None,
+                        C::Begin {
+                            cursor,
+                            normalized_cursor,
+                        } => CaptureEvent::Begin {
+                            cursor,
+                            normalized_cursor,
                         },
                         C::Input(input) => CaptureEvent::Input(input.into_event()),
                         C::AutoRelease => CaptureEvent::AutoRelease,

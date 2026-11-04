@@ -52,6 +52,30 @@ impl Window {
         window
     }
 
+    pub(crate) fn set_runtime_state(&self, state: mousehop_ipc::RuntimeState) {
+        let imp = self.imp();
+        imp.runtime_update.set(true);
+        imp.sharing_switch
+            .set_active(state == mousehop_ipc::RuntimeState::Running);
+        imp.runtime_state_row
+            .set_subtitle(crate::i18n::tr(match state {
+                mousehop_ipc::RuntimeState::Running => "Running in the background",
+                mousehop_ipc::RuntimeState::Paused => "Sharing paused",
+                mousehop_ipc::RuntimeState::Stopped => "Stopped",
+            }));
+        imp.runtime_update.set(false);
+    }
+    pub(crate) fn set_autostart(&self, enabled: bool, managed: bool, error: Option<String>) {
+        let imp = self.imp();
+        imp.runtime_update.set(true);
+        imp.autostart_switch.set_active(enabled);
+        imp.autostart_switch.set_sensitive(!managed);
+        imp.runtime_update.set(false);
+        if let Some(error) = error {
+            self.show_toast(&error);
+        }
+    }
+
     fn clients(&self) -> gio::ListStore {
         self.imp()
             .clients
@@ -589,7 +613,16 @@ impl Window {
     }
 
     pub(super) fn request_release_threshold(&self, threshold: u32) {
-        self.request(FrontendRequest::SetReleaseThreshold(threshold));
+        self.imp()
+            .release_threshold_edit
+            .borrow_mut()
+            .edit(threshold);
+        if let Err(error) = self.try_request(FrontendRequest::SetReleaseThreshold(threshold)) {
+            let confirmed = self.imp().release_threshold_edit.borrow_mut().cancel();
+            self.set_release_threshold(confirmed);
+            log::error!("Cannot update release threshold: {error}");
+            self.show_toast(&error.to_string());
+        }
     }
 
     pub(super) fn request_release_bind(&self, chord: Vec<mousehop_ipc::scancode::Linux>) {
@@ -674,13 +707,8 @@ impl Window {
                 ),
             );
             window.set_apps(imp.suppressed_apps.borrow().clone());
-            // The daemon (a forked LSUIElement child) can't see
-            // other apps via NSWorkspace / NSRunningApplication —
-            // those APIs are scoped to the caller's loginwindow
-            // session and the daemon doesn't fully inherit one.
-            // The GUI process IS Aqua-attached, so we enumerate
-            // here and skip the IPC roundtrip entirely.
-            window.set_running_apps(input_capture::frontmost_app::list_running_apps());
+            // The desktop Agent owns platform application enumeration.
+            self.request(FrontendRequest::ListRunningApps);
             // Auto-refresh every 5s while the modal is visible so
             // launches/quits surface eventually without thrashing
             // the main thread (each refresh re-encodes ~30 PNG
@@ -689,6 +717,7 @@ impl Window {
             // disappear mid-interaction. Timer self-detaches when
             // the window is dropped.
             let window_weak = window.downgrade();
+            let parent_weak = self.downgrade();
             glib::source::timeout_add_local(std::time::Duration::from_secs(5), move || {
                 let Some(window) = window_weak.upgrade() else {
                     return glib::ControlFlow::Break;
@@ -699,7 +728,9 @@ impl Window {
                 if window.picker_is_open() {
                     return glib::ControlFlow::Continue;
                 }
-                window.set_running_apps(input_capture::frontmost_app::list_running_apps());
+                if let Some(parent) = parent_weak.upgrade() {
+                    parent.request(FrontendRequest::ListRunningApps);
+                }
                 glib::ControlFlow::Continue
             });
             imp.clipboard_privacy_window.replace(Some(window));
@@ -708,7 +739,7 @@ impl Window {
             // running-apps picker in case they changed while the
             // modal was hidden.
             window.set_apps(imp.suppressed_apps.borrow().clone());
-            window.set_running_apps(input_capture::frontmost_app::list_running_apps());
+            self.request(FrontendRequest::ListRunningApps);
         }
         if let Some(window) = imp.clipboard_privacy_window.borrow().as_ref() {
             window.present();
@@ -751,24 +782,27 @@ impl Window {
         self.request(FrontendRequest::RemoveAuthorizedKey(fp));
     }
 
+    fn try_request(&self, request: FrontendRequest) -> std::io::Result<()> {
+        let mut writer = self.imp().frontend_request_writer.borrow_mut();
+        match writer.as_mut() {
+            Some(writer) => writer.request(request),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Mousehop service is reconnecting. Please retry shortly.",
+            )),
+        }
+    }
+
     pub(crate) fn request(&self, request: FrontendRequest) {
-        let result = {
-            let mut writer = self.imp().frontend_request_writer.borrow_mut();
-            match writer.as_mut() {
-                Some(writer) => writer.request(request),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "Mousehop service is reconnecting. Please retry shortly.",
-                )),
-            }
-        };
-        if let Err(e) = result {
+        if let Err(e) = self.try_request(request) {
             log::error!("error sending message: {e}");
             self.show_toast(&e.to_string());
         }
     }
 
     pub(super) fn disconnect_frontend(&self) {
+        let confirmed = self.imp().release_threshold_edit.borrow_mut().cancel();
+        self.set_release_threshold(confirmed);
         self.file_paste_available(None);
         self.imp().frontend_request_writer.borrow_mut().take();
         self.show_toast("Mousehop service disconnected. Reconnecting…");
@@ -786,24 +820,9 @@ impl Window {
         self.request(FrontendRequest::Sync);
     }
 
-    pub(super) fn native_paste_forwarding(&self, forwarding: bool) {
-        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
-            panel.set_forwarding(forwarding);
-        }
-    }
-    pub(super) fn prepare_native_file_paste(&self, id: [u8; 16], version: Option<u64>) {
-        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
-            panel.prepare_native(id, version);
-        }
-    }
     pub(super) fn file_paste_available(&self, offer: Option<mousehop_ipc::FilePasteOffer>) {
         if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
             panel.available(offer);
-        }
-    }
-    pub(super) fn file_paste_progress(&self, progress: mousehop_ipc::FilePasteProgress) {
-        if let Some(panel) = self.imp().file_paste_panel.borrow().as_ref() {
-            panel.update(progress);
         }
     }
 
@@ -843,6 +862,14 @@ impl Window {
 
     pub(super) fn set_release_threshold(&self, threshold: u32) {
         let imp = self.imp();
+        if imp
+            .release_threshold_edit
+            .borrow_mut()
+            .confirm(threshold)
+            .is_none()
+        {
+            return;
+        }
         // Block the value-changed handler so programmatically setting
         // the slider value (e.g. on Sync from the daemon) doesn't
         // ricochet back as a SetReleaseThreshold request.
@@ -920,42 +947,6 @@ impl Window {
             row.set_subtitle(crate::i18n::tr("Grant accessibility permission to enable."));
             set_button_content_label(button, crate::i18n::tr("Grant"));
         }
-    }
-
-    /// Modal "Relaunch Required" alert, shown once when Accessibility is
-    /// granted while the app is already running.
-    ///
-    /// Called only from the Accessibility grant-*transition* watcher — NOT
-    /// from the general capture/emulation status update. The transition is
-    /// the one unambiguous "relaunch needed" signal: AX was missing when
-    /// the backends were created, and the user has now granted it. Triggering
-    /// off "AX granted && capture/emulation off" instead
-    /// would also fire during the brief startup window before the daemon
-    /// reports healthy status, re-prompting on every relaunch — an
-    /// infinite loop. The relaunched process starts with AX already
-    /// granted, so no transition occurs and the alert does not re-fire.
-    ///
-    /// "Quit & Reopen" reuses the same relaunch path as the inline row's
-    /// Relaunch button. The alert is a native macOS panel drawn by a
-    /// short-lived `osascript` subprocess (see
-    /// `macos_privacy::show_relaunch_required_alert` for why an in-process
-    /// `NSAlert` can't be used under GTK4). We defer the call onto a GTK
-    /// idle callback so it doesn't run in the middle of a widget update /
-    /// signal emission; the subprocess is non-blocking and its completion
-    /// closure runs later on the main thread when the user picks a button.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn show_relaunch_required_dialog(&self) {
-        let app = self.application();
-        glib::idle_add_local_once(move || {
-            crate::macos_privacy::show_relaunch_required_alert(move |relaunch| {
-                if relaunch {
-                    crate::macos_privacy::relaunch_bundle();
-                    if let Some(app) = &app {
-                        app.quit();
-                    }
-                }
-            });
-        });
     }
 
     pub(super) fn set_authorized_keys(

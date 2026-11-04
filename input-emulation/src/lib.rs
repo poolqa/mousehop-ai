@@ -36,6 +36,8 @@ pub mod clipboard;
 mod dummy;
 mod error;
 mod modifiers;
+#[cfg(any(windows, test))]
+mod windows_modifiers;
 
 pub type EmulationHandle = u64;
 
@@ -58,7 +60,7 @@ fn edge_warp_projection(
     cross_fraction: f64,
 ) -> Option<((i32, i32), (i32, i32))> {
     let bounds = layout.bounds()?;
-    let global = layout.project_fraction(edge, cross_fraction)?;
+    let global = layout.inset_landing(edge, layout.project_fraction(edge, cross_fraction)?)?;
     let origin = bounds.origin();
     let relative = (
         i32::try_from(i64::from(global.0) - i64::from(origin.0)).ok()?,
@@ -132,6 +134,7 @@ pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
     /// Per-handle receive-side post-processing. Populated by the
     /// upper layer before each event is consumed; missing entries
     /// resolve to `ReceivePostProcessing::default()` (passthrough).
@@ -185,6 +188,7 @@ impl InputEmulation {
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
             post_processing: HashMap::new(),
             clipboard,
         })
@@ -244,6 +248,9 @@ impl InputEmulation {
                     .flat_map(|keys| keys.drain())
                     .collect();
                 remote.release_keys(keys);
+                for buttons in self.pressed_buttons.values_mut() {
+                    buttons.clear();
+                }
                 self.desktop_generation = generation;
             }
             if let Event::Clipboard(event) = &event {
@@ -320,10 +327,33 @@ impl InputEmulation {
             other => other,
         };
         match event {
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => {
+                self.emulation.consume(event, handle).await?;
+                if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+                    match state {
+                        1 => {
+                            buttons.insert(button);
+                        }
+                        0 => {
+                            buttons.remove(&button);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // prevent double pressed / released keys
-                if self.update_pressed_keys(handle, key, state) {
+                let needed = self.pressed_keys.get(&handle).is_some_and(|keys| {
+                    if state == 0 {
+                        keys.contains(&key)
+                    } else {
+                        !keys.contains(&key)
+                    }
+                });
+                if needed {
                     self.emulation.consume(event, handle).await?;
+                    self.update_pressed_keys(handle, key, state);
                 }
                 Ok(())
             }
@@ -370,6 +400,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -381,6 +412,7 @@ impl InputEmulation {
         let _ = self.release_keys(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.post_processing.remove(&handle);
             self.emulation.destroy(handle).await
         }
@@ -442,8 +474,31 @@ impl InputEmulation {
     }
 
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
-        if let Some(keys) = self.pressed_keys.get_mut(&handle) {
-            let keys = keys.drain().collect::<Vec<_>>();
+        // A peer can leave/disconnect before its button-up arrives. Release
+        // buttons too, otherwise local Windows clicks remain part of a drag.
+        let buttons = self
+            .pressed_buttons
+            .get(&handle)
+            .cloned()
+            .unwrap_or_default();
+        for button in buttons {
+            self.emulation
+                .consume(
+                    Event::Pointer(PointerEvent::Button {
+                        time: 0,
+                        button,
+                        state: 0,
+                    }),
+                    handle,
+                )
+                .await?;
+            if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+                buttons.remove(&button);
+            }
+            log::warn!("releasing stuck mouse button: {button}");
+        }
+        if let Some(keys) = self.pressed_keys.get(&handle) {
+            let keys = keys.iter().copied().collect::<Vec<_>>();
             for key in keys {
                 let event = Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
@@ -451,6 +506,7 @@ impl InputEmulation {
                     state: 0,
                 });
                 self.emulation.consume(event, handle).await?;
+                self.update_pressed_keys(handle, key, 0);
                 if let Ok(key) = input_event::scancode::Linux::try_from(key) {
                     log::warn!("releasing stuck key: {key:?}");
                 }
@@ -588,21 +644,21 @@ mod display_tests {
         ]);
         assert_eq!(
             edge_warp_projection(&linux, DisplayEdge::Right, 500.5 / 2088.0),
-            Some(((3071, 500), (4095, 500))),
+            Some(((3063, 500), (4087, 500))),
         );
         assert_eq!(
             edge_warp_projection(&linux, DisplayEdge::Right, 1800.5 / 2088.0),
-            Some(((2115, 1800), (3139, 1800))),
+            Some(((2107, 1800), (3131, 1800))),
         );
 
         let mac = DisplayLayout::new([(0, 0, 3072, 1728), (-1728, 0, 1728, 1117)]);
         assert_eq!(
             edge_warp_projection(&mac, DisplayEdge::Left, 500.5 / 1728.0),
-            Some(((-1728, 500), (0, 500))),
+            Some(((-1720, 500), (8, 500))),
         );
         assert_eq!(
             edge_warp_projection(&mac, DisplayEdge::Left, 1500.5 / 1728.0),
-            Some(((0, 1500), (1728, 1500))),
+            Some(((8, 1500), (1736, 1500))),
         );
     }
 }

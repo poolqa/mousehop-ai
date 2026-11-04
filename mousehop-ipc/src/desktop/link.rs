@@ -28,7 +28,7 @@ pub fn initialize() -> Arc<Link> {
     LINK.get_or_init(|| Arc::new(Link::default())).clone()
 }
 pub fn pipe_name(session: u32) -> String {
-    format!(r"\\.\pipe\Mousehop.Desktop.v2.{session}")
+    format!(r"\\.\pipe\Mousehop.Desktop.v3.{session}")
 }
 
 fn clipboard_matches_event(clipboard: &Clipboard, event: &ClipboardEvent) -> bool {
@@ -142,11 +142,14 @@ impl Link {
             let _ = tx.try_send(Request::CrossingModifier(edge, modifier));
         }
     }
-    pub fn send(&self, request: Request) {
-        let s = self.state.lock().unwrap();
-        if let Some(tx) = s.sender.as_ref() {
-            if tx.try_send(request).is_err() {
-                log::warn!("Desktop helper command queue unavailable; dropping input");
+    pub async fn send(&self, request: Request) {
+        let sender = self.state.lock().unwrap().sender.clone();
+        if let Some(tx) = sender {
+            // Button/key transitions and Destroy must stay ordered and must
+            // not disappear behind a burst of motion. Await capacity without
+            // holding the link mutex or blocking the runtime thread.
+            if tx.send(request).await.is_err() {
+                log::warn!("Desktop helper disconnected before input delivery");
             }
         }
     }
@@ -239,7 +242,7 @@ impl Link {
         match response {
             Response::Geometry(b) => s.bounds = b,
             Response::Capture { edge, event } => {
-                if s.secure && matches!(event, Capture::Begin | Capture::Input(_)) {
+                if s.secure && matches!(event, Capture::Begin { .. } | Capture::Input(_)) {
                     return;
                 }
                 if let Some(tx) = s.capture_tx.as_ref() {
@@ -317,7 +320,7 @@ impl Link {
 #[cfg(windows)]
 pub fn server(session: u32, first: bool) -> io::Result<NamedPipeServer> {
     require_system()?;
-    let descriptor = SecurityDescriptor::new("D:P(A;;GA;;;SY)")?;
+    let descriptor = SecurityDescriptor::system_only()?;
     let mut attrs = descriptor.attributes();
     unsafe {
         ServerOptions::new()
@@ -663,12 +666,12 @@ mod tests {
         assert!(!root.exists());
     }
 
-    #[test]
-    fn replaced_helper_cannot_publish_or_replay_old_input() {
+    #[tokio::test]
+    async fn replaced_helper_cannot_publish_or_replay_old_input() {
         let link = Link::default();
         let (tx, mut rx) = mpsc::channel(8);
         assert!(link.attach(0, false, Some((1920, 1080)), tx));
-        link.send(Request::Destroy(7));
+        link.send(Request::Destroy(7)).await;
         assert!(rx.try_recv().is_ok());
         link.suspend();
         assert!(link.secure());
@@ -678,6 +681,62 @@ mod tests {
         let (tx, _) = mpsc::channel(8);
         assert!(!link.attach(0, false, None, tx));
     }
+    #[tokio::test]
+    async fn full_worker_queue_preserves_button_up_and_destroy_in_order() {
+        let link = Link::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(link.attach(0, false, None, tx));
+        let down = Request::Input {
+            handle: 7,
+            input: Input::Pointer(input_event::PointerEvent::Button {
+                time: 0,
+                button: input_event::BTN_LEFT,
+                state: 1,
+            }),
+        };
+        link.send(down).await;
+        let up = Request::Input {
+            handle: 7,
+            input: Input::Pointer(input_event::PointerEvent::Button {
+                time: 0,
+                button: input_event::BTN_LEFT,
+                state: 0,
+            }),
+        };
+        let producer = async {
+            link.send(up).await;
+            link.send(Request::Destroy(7)).await;
+        };
+        let consumer = async {
+            // Let the producer encounter a full queue before draining it.
+            tokio::task::yield_now().await;
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                received.push(rx.recv().await.unwrap());
+            }
+            assert!(matches!(
+                &received[0],
+                Request::Input {
+                    input: Input::Pointer(input_event::PointerEvent::Button { state: 1, .. }),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &received[1],
+                Request::Input {
+                    input: Input::Pointer(input_event::PointerEvent::Button { state: 0, .. }),
+                    ..
+                }
+            ));
+            assert!(matches!(&received[2], Request::Destroy(7)));
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(producer, consumer);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn replacement_cancels_outstanding_completion_without_waiting_for_timeout() {
         let link = Arc::new(Link::default());
@@ -691,8 +750,8 @@ mod tests {
         assert!(!ok);
     }
 
-    #[test]
-    fn replacement_replays_configuration_and_key_releases_but_not_input() {
+    #[tokio::test]
+    async fn replacement_replays_configuration_and_key_releases_but_not_input() {
         let link = Link::default();
         link.capture_create(1);
         link.modifier(1, Some(CrossingModifier::Control));
@@ -705,7 +764,8 @@ mod tests {
                 key: 30,
                 state: 1,
             }),
-        });
+        })
+        .await;
         let (tx, mut rx) = mpsc::channel(16);
         assert!(link.attach(1, true, Some((2560, 1080)), tx));
         assert!(matches!(rx.try_recv().unwrap(), Request::ReleaseKeys(keys) if keys == vec![29]));

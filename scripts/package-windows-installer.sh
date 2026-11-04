@@ -57,7 +57,7 @@ trap 'rm -rf "$staging"' EXIT
 # Extract only a flat EXE/DLL payload, never an arbitrary path from the archive.
 # Both release ZIP layouts (flat and mousehop-windows/) are accepted.
 python3 - "$package_zip" "$staging" "$repo_root/Cargo.toml" <<'PY'
-import pathlib, re, struct, sys, zipfile
+import hashlib, pathlib, re, struct, sys, zipfile
 archive, staging, manifest = sys.argv[1:]
 root = pathlib.Path(staging)
 with zipfile.ZipFile(archive) as z:
@@ -73,12 +73,15 @@ with zipfile.ZipFile(archive) as z:
             continue
         if '..' in path.parts or path.is_absolute() or '\\' in item.filename or ':' in item.filename:
             raise SystemExit('error: unsafe ZIP path')
-        if path.parent != parent or (path.name != 'mousehop.exe' and path.suffix.lower() != '.dll'):
+        if path.parent != parent or (path.name not in ('mousehop.exe', 'mousehop-ui.exe', 'mousehop-cli.exe') and path.suffix.lower() != '.dll'):
             continue
         if path.name.lower() in seen:
             raise SystemExit('error: duplicate Windows filename')
         seen.add(path.name.lower())
         (root / path.name).write_bytes(z.read(item))
+for required in ('mousehop.exe', 'mousehop-ui.exe', 'mousehop-cli.exe'):
+    if not (root / required).is_file():
+        raise SystemExit(f'error: package is missing {required}; rebuild all components')
 exe = (root / 'mousehop.exe').read_bytes()
 # An old portable binary has no SCM entry point; don't produce a broken installer.
 if b'windows-worker' not in exe or b'StartServiceCtrlDispatcherW' not in exe:
@@ -95,6 +98,9 @@ version = re.search(r'^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text, re.M)
 if not version:
     raise SystemExit('error: cannot determine workspace version')
 (root / 'version.txt').write_text(version[1])
+files = sorted(p for p in root.iterdir() if p.suffix.lower() in ('.exe', '.dll'))
+(root / 'payload.sha256').write_text(''.join(
+    f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
 PY
 echo "==> Building the native Windows installer helper"
 installer_helper="$repo_root/target/x86_64-pc-windows-msvc/release/mousehop-installer.exe"

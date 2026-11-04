@@ -76,7 +76,10 @@ impl Clipboard {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Capture {
-    Begin,
+    Begin {
+        cursor: Option<(i32, i32)>,
+        normalized_cursor: Option<(f32, f32)>,
+    },
     Input(Input),
     AutoRelease,
     Locked(bool),
@@ -208,6 +211,28 @@ mod tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    async fn installed_capture_begin_preserves_actual_cursor_and_fraction() {
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &Response::Capture {
+                edge: 1,
+                event: Capture::Begin {
+                    cursor: Some((1919, 400)),
+                    normalized_cursor: Some((1919.0 / 1920.0, 400.0 / 1080.0)),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(read_frame::<_, Response>(&mut bytes.as_slice()).await.unwrap(),
+            Response::Capture { edge: 1, event: Capture::Begin { cursor: Some((1919, 400)), normalized_cursor: Some((x, y)) } }
+            if (x - 1919.0 / 1920.0).abs() < 0.00001 && (y - 400.0 / 1080.0).abs() < 0.00001)
+        );
+    }
+
     #[tokio::test]
     async fn input_and_completion_round_trip() {
         let mut bytes = Vec::new();

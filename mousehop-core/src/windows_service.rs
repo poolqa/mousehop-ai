@@ -34,8 +34,9 @@ use windows::{
             Threading::{
                 CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateEventW, CreateProcessAsUserW,
                 GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenEventW,
-                OpenProcessToken, PROCESS_INFORMATION, ResetEvent, ResumeThread, STARTUPINFOW,
-                SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent, TerminateProcess, WaitForSingleObject,
+                OpenProcessToken, PROCESS_INFORMATION, ResetEvent, ResumeThread,
+                STARTF_FORCEOFFFEEDBACK, STARTUPINFOW, SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent,
+                TerminateProcess, WaitForSingleObject,
             },
         },
         UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
@@ -77,7 +78,7 @@ pub fn ensure_running() -> io::Result<()> {
         let service = ServiceHandle(OpenServiceW(
             manager.0,
             w!("Mousehop"),
-            SERVICE_START | SERVICE_QUERY_STATUS,
+            SERVICE_QUERY_STATUS,
         )?);
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut requested_start = false;
@@ -88,24 +89,46 @@ pub fn ensure_running() -> io::Result<()> {
                 return Ok(());
             }
             if status.dwCurrentState == SERVICE_STOPPED && !requested_start {
-                if let Err(e) = StartServiceW(service.0, None) {
-                    if e.code()
-                        != windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING.to_hresult()
-                    {
-                        return Err(e.into());
+                if mousehop_ipc::windows::is_elevated()? {
+                    let start =
+                        ServiceHandle(OpenServiceW(manager.0, w!("Mousehop"), SERVICE_START)?);
+                    if let Err(error) = StartServiceW(start.0, None) {
+                        if error.code()
+                            != windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING
+                                .to_hresult()
+                        {
+                            return Err(error.into());
+                        }
+                    }
+                } else {
+                    use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_HIDE};
+                    let executable = std::env::current_exe()?;
+                    let path = wide(
+                        executable
+                            .to_str()
+                            .ok_or_else(|| io::Error::other("Non-Unicode executable path"))?,
+                    );
+                    let result = ShellExecuteW(
+                        None,
+                        w!("runas"),
+                        PCWSTR(path.as_ptr()),
+                        w!("admin-start"),
+                        None,
+                        SW_HIDE,
+                    );
+                    if result.0 as usize <= 32 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Administrator consent is required to start the stopped service",
+                        ));
                     }
                 }
                 requested_start = true;
-            } else if status.dwCurrentState == SERVICE_STOPPED && requested_start {
-                return Err(io::Error::other(format!(
-                    "Mousehop service stopped during startup (Windows error {}). See C:\\ProgramData\\Mousehop\\service.log.",
-                    status.dwWin32ExitCode
-                )));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "Mousehop service did not start within 30 seconds. See C:\\ProgramData\\Mousehop\\service.log.",
+                    "Mousehop service did not start within 30 seconds. See the dated log files in C:\\ProgramData\\Mousehop.",
                 ));
             }
             std::thread::sleep(TICK);
@@ -339,6 +362,7 @@ fn spawn(token: &Handle, desktop: &str, arguments: &str) -> io::Result<Child> {
     let startup = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         lpDesktop: PWSTR(desktop.as_mut_ptr()),
+        dwFlags: STARTF_FORCEOFFFEEDBACK,
         ..Default::default()
     };
     unsafe {
@@ -522,58 +546,6 @@ pub async fn worker_shutdown() -> io::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(())
-}
-
-/// Relaunch only the settings UI with consent; the service owns the daemon.
-pub fn elevate_settings() -> io::Result<bool> {
-    use windows::Win32::{
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TokenElevation},
-        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
-    };
-    let token = {
-        let mut handle = HANDLE::default();
-        unsafe {
-            OpenProcessToken(
-                GetCurrentProcess(),
-                windows::Win32::Security::TOKEN_QUERY,
-                &mut handle,
-            )?;
-        }
-        Handle(handle)
-    };
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut length = 0;
-    unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
-            size_of_val(&elevation) as u32,
-            &mut length,
-        )?;
-        if elevation.TokenIsElevated != 0 {
-            return Ok(false);
-        }
-        let exe = std::env::current_exe()?;
-        let exe = wide(
-            exe.to_str()
-                .ok_or_else(|| io::Error::other("Non-Unicode executable path"))?,
-        );
-        let result = ShellExecuteW(
-            None,
-            w!("runas"),
-            PCWSTR(exe.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-        if result.0 as usize <= 32 {
-            return Err(io::Error::other(
-                "Administrator consent is required to configure the Mousehop service",
-            ));
-        }
-    }
-    Ok(true)
 }
 
 /// Each worker starts on one desktop and never switches in place. Clipboard
@@ -776,7 +748,7 @@ pub async fn desktop_worker(mut config: crate::config::Config) -> io::Result<()>
                     let Some(event) = event else { return Err(io::Error::other("desktop capture ended")); };
                     let (handle,event) = event.map_err(io::Error::other)?;
                     let event = match event {
-                        CaptureEvent::Begin {..} => Capture::Begin,
+                        CaptureEvent::Begin {cursor,normalized_cursor} => Capture::Begin {cursor,normalized_cursor},
                         CaptureEvent::Input(event) => { let Some(input) = Input::from_event(&event) else { continue; }; Capture::Input(input) },
                         CaptureEvent::AutoRelease => Capture::AutoRelease,
                         CaptureEvent::HostInputState(state) => Capture::Locked(state == HostInputState::Locked),
@@ -883,4 +855,79 @@ pub(crate) fn desktop_file_access() -> io::Result<DesktopFileAccess> {
         ImpersonateLoggedOnUser(token.0)?;
     }
     Ok(DesktopFileAccess(true, std::marker::PhantomData))
+}
+
+// A volatile registry value survives process/SCM recovery and is discarded by
+// Windows at reboot. Intentional Exit must never look like a crashed worker.
+pub fn runtime_state() -> io::Result<mousehop_ipc::RuntimeState> {
+    if !mousehop_ipc::windows::service_mode() {
+        return Ok(mousehop_ipc::RuntimeState::Running);
+    }
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+    let mut state = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("Software\\Mousehop\\Runtime"),
+            w!("State"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut state as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    if result == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+        return Ok(mousehop_ipc::RuntimeState::Running);
+    }
+    result.ok()?;
+    match state {
+        0 => Ok(mousehop_ipc::RuntimeState::Running),
+        1 => Ok(mousehop_ipc::RuntimeState::Paused),
+        2 => Ok(mousehop_ipc::RuntimeState::Stopped),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid Mousehop runtime state",
+        )),
+    }
+}
+pub fn save_runtime_state(state: mousehop_ipc::RuntimeState) -> io::Result<()> {
+    if !mousehop_ipc::windows::service_mode() {
+        return Ok(());
+    }
+    mousehop_ipc::windows::require_system()?;
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_VOLATILE, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
+    };
+    let state: u32 = match state {
+        mousehop_ipc::RuntimeState::Running => 0,
+        mousehop_ipc::RuntimeState::Paused => 1,
+        mousehop_ipc::RuntimeState::Stopped => 2,
+    };
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            w!("Software\\Mousehop\\Runtime"),
+            None,
+            None,
+            REG_OPTION_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()?;
+        let result = RegSetValueExW(
+            key,
+            w!("State"),
+            None,
+            REG_DWORD,
+            Some(&state.to_le_bytes()),
+        );
+        let _ = RegCloseKey(key);
+        result.ok()?;
+    }
+    Ok(())
 }

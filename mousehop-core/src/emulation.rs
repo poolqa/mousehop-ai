@@ -285,6 +285,7 @@ pub(crate) enum EmulationEvent {
 }
 
 enum EmulationRequest {
+    SetPaused(bool, oneshot::Sender<()>),
     Reenable,
     Release {
         addr: SocketAddr,
@@ -309,6 +310,7 @@ impl Emulation {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
+            clipboard_epoch: Rc::new(Cell::new(0)),
             listener,
             emulation_proxy,
             request_rx,
@@ -339,6 +341,17 @@ impl Emulation {
                 handover,
             })
             .expect("channel closed");
+    }
+
+    pub(crate) async fn set_paused(&self, paused: bool) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .request_tx
+            .send(EmulationRequest::SetPaused(paused, tx))
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
     }
 
     pub(crate) fn reenable(&self) {
@@ -380,6 +393,7 @@ impl Emulation {
 }
 
 struct ListenTask {
+    clipboard_epoch: Rc<Cell<u64>>,
     listener: MousehopListener,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
@@ -519,10 +533,12 @@ impl ListenTask {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+        let mut paused = false;
         loop {
             select! {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr, session }) => {
+                        if paused && !matches!(&event, ProtoEvent::Ping | ProtoEvent::Pong(_) | ProtoEvent::HandoverLeaveAck { .. } | ProtoEvent::Hello { .. }) { continue; }
                         log::trace!("{event} <-<-<-<-<- {addr} session {session}");
                         last_response.insert(addr, (session, Instant::now()));
                         match event {
@@ -923,6 +939,8 @@ impl ListenTask {
                                         let _ = self.event_tx.send(EmulationEvent::FileOffer { addr, offer: stream_offer });
                                         continue;
                                     }
+                                    let epoch = self.clipboard_epoch.clone();
+                                    let expected_epoch = epoch.get();
                                     let proxy_tx = self.emulation_proxy.request_tx.clone();
                                     let event_tx = self.event_tx.clone();
                                     let origin = stream_offer.offer.origin_fingerprint.clone();
@@ -932,6 +950,7 @@ impl ListenTask {
                                         match receive_stream(addr, stream_offer, TransferLimits::default()).await {
                                             Ok(staged) => match staged.into_event() {
                                                 Ok(event) => {
+                                                    if epoch.get() != expected_epoch { return; }
                                                     #[cfg(windows)]
                                                     if mousehop_ipc::desktop::current().is_some_and(|link| link.secure() || Some(link.generation()) != desktop_generation) {
                                                         log::debug!("discarding clipboard transfer across a desktop transition");
@@ -1005,7 +1024,7 @@ impl ListenTask {
                                     );
                                 }
                             }
-                            ProtoEvent::Ping => self.listener.reply(addr, session, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            ProtoEvent::Ping => self.listener.reply(addr, session, ProtoEvent::Pong(!paused && self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
                             // receive_loop populates its `peer_commit`,
@@ -1138,6 +1157,30 @@ impl ListenTask {
                 }
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
+                    EmulationRequest::SetPaused(value, completed) => {
+                        paused = value;
+                        self.clipboard_epoch.set(self.clipboard_epoch.get().wrapping_add(1));
+                        if paused {
+                            let owners: Vec<_> = input_owner_sessions.iter().map(|(&(addr, session), &serial)| (addr, session, serial)).collect();
+                            for (addr, session, serial) in owners {
+                                if self.session_is_current(addr, session) {
+                                    pending_leaves.insert((addr, session, serial), LEAVE_RELEASE_ONLY);
+                                    self.listener.reply(addr, session, ProtoEvent::HandoverLeave { serial, mode: LEAVE_RELEASE_ONLY }).await;
+                                }
+                            }
+                            for &(addr, session) in &legacy_enter_ready {
+                                if self.session_is_current(addr, session) {
+                                    self.listener.reply(addr, session, ProtoEvent::Leave(LEAVE_RELEASE_ONLY)).await;
+                                }
+                            }
+                            let (tx, rx) = oneshot::channel();
+                            if self.emulation_proxy.request_tx.send(ProxyRequest::ReleaseAll(tx)).is_ok() { let _ = rx.await; }
+                            completed_handovers.clear();
+                            legacy_enter_ready.clear();
+                            input_owner_sessions.clear();
+                        }
+                        let _ = completed.send(());
+                    },
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release { addr, session, handover } => {
@@ -1364,6 +1407,7 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
+    ReleaseAll(oneshot::Sender<()>),
     Input(Event, SocketAddr),
     Remove(SocketAddr),
     /// Terminal DTLS teardown. Unlike `Remove`, also discard per-address
@@ -1568,6 +1612,10 @@ impl EmulationTask {
             // wait for reenable request
             loop {
                 match self.request_rx.recv().await.expect("channel closed") {
+                    ProxyRequest::ReleaseAll(completion) => {
+                        self.handles.clear();
+                        let _ = completion.send(());
+                    }
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
@@ -1789,6 +1837,11 @@ impl EmulationTask {
                             emulation.set_post_processing(handle, pp);
                         }
                     }
+                    ProxyRequest::ReleaseAll(completion) => {
+                        for handle in self.handles.values().copied().collect::<Vec<_>>() { emulation.destroy(handle).await; }
+                        self.handles.clear();
+                        let _ = completion.send(());
+                    }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
@@ -1820,6 +1873,10 @@ async fn wait_for_termination(
 ) {
     loop {
         match rx.recv().await.expect("channel closed") {
+            ProxyRequest::ReleaseAll(completion) => {
+                handles.clear();
+                let _ = completion.send(());
+            }
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(addr) => {

@@ -8,14 +8,13 @@ use crate::{
     discovery::{Discovery, DiscoveryEvent, PrimaryCache},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
-    file_paste::{ActivePaste, OutgoingFile, RemoteFileOffer},
+    file_paste::{ActivePaste, OutgoingFile, PendingFileConflict, RemoteFileOffer},
     latency::{LatencyProber, ProbeResult},
     listen::{ListenerCreationError, ListenerSession, MousehopListener},
     network::current_network_id,
 };
 use futures::StreamExt;
 use input_capture::clipboard::{ClipboardMonitor, SuppressionList, clipboard_signature};
-use input_capture::frontmost_app;
 use input_event::{ClipboardEvent, Event as InputEvent};
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -93,7 +92,61 @@ fn take_ready_clipboards(
         .collect()
 }
 
+struct PreparedClipboard {
+    cancel: tokio_util::sync::CancellationToken,
+    targets: Vec<ClientHandle>,
+    origin: String,
+    version: Option<u64>,
+    is_file: bool,
+    capability: u32,
+    result: Result<OutgoingPayload, crate::clipboard_bulk::BulkTransportError>,
+}
+
+impl PreparedClipboard {
+    fn can_publish(&self, sharing: bool, desktop: bool, version: Option<u64>) -> bool {
+        !self.cancel.is_cancelled()
+            && sharing
+            && desktop
+            && (!self.is_file || version == self.version)
+    }
+}
+
+struct ClipboardPreparations {
+    jobs: tokio::task::JoinSet<PreparedClipboard>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+impl Default for ClipboardPreparations {
+    fn default() -> Self {
+        Self {
+            jobs: tokio::task::JoinSet::new(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+}
+impl ClipboardPreparations {
+    fn cancel(&mut self) {
+        self.cancel.cancel();
+        self.cancel = tokio_util::sync::CancellationToken::new();
+        self.jobs.abort_all();
+    }
+}
+impl Drop for ClipboardPreparations {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 pub struct Service {
+    #[cfg(target_os = "macos")]
+    _permission_watcher: Option<crate::macos_tcc_watch::PermissionWatcher>,
+    permission_revocations: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    permissions_revoked: bool,
+    sharing: bool,
+    stopped: bool,
+    exit_requested: bool,
+    desktop_agent_seen: Option<Instant>,
+    desktop_available: bool,
+    pending_pairing: HashSet<String>,
     /// configuration
     config: Config,
     /// input capture
@@ -173,11 +226,14 @@ pub struct Service {
     // Latest clipboard per peer while its authenticated outbound session connects.
     pending_clipboards: HashMap<ClientHandle, DeferredClipboard>,
     file_senders: HashMap<ClientHandle, OutgoingFile>,
+    clipboard_preparations: ClipboardPreparations,
     file_offer: Option<RemoteFileOffer>,
     active_paste: Option<ActivePaste>,
     file_progress_tx: tokio::sync::mpsc::UnboundedSender<FilePasteProgress>,
     file_progress_rx: tokio::sync::mpsc::UnboundedReceiver<FilePasteProgress>,
     last_file_progress: Option<FilePasteProgress>,
+    file_conflict_tx: tokio::sync::mpsc::UnboundedSender<PendingFileConflict>,
+    file_conflict_rx: tokio::sync::mpsc::UnboundedReceiver<PendingFileConflict>,
     clipboard_version: Option<u64>,
     native_arming: Option<([u8; 16], Instant)>,
     /// Shared with [`ClipboardMonitor`]; mutations to the inner
@@ -380,7 +436,29 @@ impl Service {
             None
         };
         let (file_progress_tx, file_progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (file_conflict_tx, file_conflict_rx) = tokio::sync::mpsc::unbounded_channel();
+        #[cfg(windows)]
+        let state = crate::windows_service::runtime_state()?;
+        #[cfg(not(windows))]
+        let state = mousehop_ipc::RuntimeState::Running;
+        #[cfg(target_os = "macos")]
+        let (permission_watcher, permission_revocations) = match crate::macos_tcc_watch::spawn() {
+            Some((watcher, changes)) => (Some(watcher), Some(changes)),
+            None => (None, None),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let permission_revocations = None;
         let service = Self {
+            #[cfg(target_os = "macos")]
+            _permission_watcher: permission_watcher,
+            permission_revocations,
+            permissions_revoked: false,
+            sharing: state == mousehop_ipc::RuntimeState::Running,
+            stopped: state == mousehop_ipc::RuntimeState::Stopped,
+            exit_requested: false,
+            desktop_agent_seen: None,
+            desktop_available: true,
+            pending_pairing: HashSet::new(),
             config,
             capture,
             emulation,
@@ -413,11 +491,14 @@ impl Service {
             recent_forwarded: HashMap::new(),
             pending_clipboards: HashMap::new(),
             file_senders: HashMap::new(),
+            clipboard_preparations: ClipboardPreparations::default(),
             file_offer: None,
             active_paste: None,
             file_progress_tx,
             file_progress_rx,
             last_file_progress: None,
+            file_conflict_tx,
+            file_conflict_rx,
             clipboard_version: input_capture::clipboard::native_clipboard_version(),
             native_arming: None,
             clipboard_suppression,
@@ -427,6 +508,9 @@ impl Service {
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
+        if !self.sharing {
+            self.set_sharing(false, self.stopped).await;
+        }
         let active = self.client_manager.active_clients();
         for handle in active.iter() {
             // small hack: `activate_client()` checks, if the client
@@ -455,7 +539,34 @@ impl Service {
         let mut clipboard_retry = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
+                _ = wait_for_permission_revocation(&mut self.permission_revocations) => {
+                    self.permissions_revoked = true;
+                    self.set_sharing(false, false).await;
+                    self.notify_frontend(FrontendEvent::OpenSettings);
+                    self.notify_frontend(FrontendEvent::Error(
+                        "macOS input permissions were removed. Grant permissions in System Settings, then restart Mousehop from Settings.".into()
+                    ));
+                },
                 _ = clipboard_retry.tick() => {
+                    if self.desktop_agent_seen.is_some_and(|seen| seen.elapsed() > Duration::from_secs(5)) {
+                        log::warn!("Desktop Agent heartbeat expired; ending its sharing session");
+                        self.desktop_agent_seen = None;
+                        self.invalidate_file_transfers().await;
+                        #[cfg(windows)]
+                        let installed = mousehop_ipc::windows::service_mode();
+                        #[cfg(not(windows))]
+                        let installed = false;
+                        if !installed { break; }
+                    }
+                    #[cfg(windows)]
+                    let available = mousehop_ipc::desktop::current().map_or(true, |link| link.ready() && !link.secure());
+                    #[cfg(not(windows))]
+                    let available = true;
+                    if available != self.desktop_available {
+                        self.desktop_available = available;
+                        self.notify_frontend(FrontendEvent::DesktopAvailable(available));
+                        if !available { self.invalidate_file_transfers().await; }
+                    }
                     let version = input_capture::clipboard::native_clipboard_version();
                     if self.native_arming.is_some_and(|(_, started)| started.elapsed() >= Duration::from_secs(5)) {
                         self.invalidate_file_transfers().await;
@@ -468,7 +579,18 @@ impl Service {
                     if !self.pending_clipboards.is_empty() { self.retry_pending_clipboards().await; }
                 },
                 Some(progress) = self.file_progress_rx.recv() => self.file_paste_progress(progress),
-                request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
+                Some(conflict) = self.file_conflict_rx.recv() => self.file_paste_conflict(conflict),
+                Some(result) = self.clipboard_preparations.jobs.join_next(), if !self.clipboard_preparations.jobs.is_empty() => {
+                    match result {
+                        Ok(prepared) => self.clipboard_prepared(prepared).await,
+                        Err(error) if error.is_cancelled() => {},
+                        Err(error) => log::error!("Clipboard preparation task failed: {error}"),
+                    }
+                },
+                request = self.frontend_listener.next() => {
+                    self.handle_frontend_request(request).await;
+                    if self.exit_requested { break; }
+                },
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
@@ -490,6 +612,8 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        self.handle_frontend_pending().await;
+        self.frontend_listener.flush().await;
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -502,6 +626,42 @@ impl Service {
         Ok(())
     }
 
+    async fn set_sharing(&mut self, enabled: bool, stopped: bool) {
+        if enabled && self.permissions_revoked {
+            self.notify_frontend(FrontendEvent::Error(
+                "Restart Mousehop after granting macOS input permissions.".into(),
+            ));
+            return;
+        }
+        self.sharing = enabled;
+        self.stopped = stopped;
+        #[cfg(windows)]
+        if let Err(error) = crate::windows_service::save_runtime_state(if stopped {
+            mousehop_ipc::RuntimeState::Stopped
+        } else if enabled {
+            mousehop_ipc::RuntimeState::Running
+        } else {
+            mousehop_ipc::RuntimeState::Paused
+        }) {
+            log::error!("Persist runtime intent: {error}");
+        }
+        if enabled {
+            self.capture.reenable();
+        } else {
+            self.capture.pause().await;
+            self.invalidate_file_transfers().await;
+            self.pending_clipboards.clear();
+        }
+        self.emulation.set_paused(!enabled).await;
+        self.notify_frontend(FrontendEvent::RuntimeState(if stopped {
+            mousehop_ipc::RuntimeState::Stopped
+        } else if enabled {
+            mousehop_ipc::RuntimeState::Running
+        } else {
+            mousehop_ipc::RuntimeState::Paused
+        }));
+    }
+
     async fn handle_frontend_request(
         &mut self,
         request: Option<Result<FrontendRequest, IpcError>>,
@@ -510,8 +670,71 @@ impl Service {
             Ok(r) => r,
             Err(e) => return log::error!("error receiving request: {e}"),
         };
+        if self.permissions_revoked
+            && matches!(
+                request,
+                FrontendRequest::EnableCapture | FrontendRequest::EnableEmulation
+            )
+        {
+            self.notify_frontend(FrontendEvent::Error(
+                "Restart Mousehop after granting macOS input permissions.".into(),
+            ));
+            return;
+        }
         match request {
+            FrontendRequest::Hello { .. } => {}
+            FrontendRequest::SetAutostart(enabled) => {
+                self.notify_frontend(FrontendEvent::ConfigureAutostart(enabled))
+            }
+            FrontendRequest::AutostartReport {
+                enabled,
+                managed,
+                error,
+            } => self.notify_frontend(FrontendEvent::Autostart {
+                enabled,
+                managed,
+                error,
+            }),
+            FrontendRequest::SetSharing(enabled) => self.set_sharing(enabled, false).await,
+            FrontendRequest::Quit => {
+                log::info!("Application quit requested through local IPC");
+                self.set_sharing(false, true).await;
+                // Installed Windows keeps the service alive. Notify Settings
+                // immediately in both modes, before accepting another request.
+                self.handle_frontend_pending().await;
+                #[cfg(windows)]
+                let installed = mousehop_ipc::windows::service_mode();
+                #[cfg(not(windows))]
+                let installed = false;
+                self.exit_requested = !installed;
+            }
+            FrontendRequest::RunningAppsReport(apps) => {
+                self.notify_frontend(FrontendEvent::RunningApps(apps))
+            }
+            FrontendRequest::Restart => self.notify_frontend(FrontendEvent::Restart),
+            FrontendRequest::OpenSettings => self.notify_frontend(FrontendEvent::OpenSettings),
+            FrontendRequest::DesktopAgentConnected { sharing } => {
+                self.invalidate_file_transfers().await;
+                self.desktop_agent_seen = Some(Instant::now());
+                self.set_sharing(sharing, false).await;
+                self.sync_frontend();
+                self.notify_frontend(FrontendEvent::AgentAttached(if sharing {
+                    mousehop_ipc::RuntimeState::Running
+                } else {
+                    mousehop_ipc::RuntimeState::Paused
+                }));
+            }
+            FrontendRequest::DesktopAgentHeartbeat => {
+                self.desktop_agent_seen = Some(Instant::now())
+            }
+            FrontendRequest::DesktopAgentDisconnected => {
+                self.desktop_agent_seen = None;
+                self.invalidate_file_transfers().await;
+            }
             FrontendRequest::PrepareNativeFilePaste { id } => {
+                if !self.sharing || !self.desktop_available || self.desktop_agent_seen.is_none() {
+                    return;
+                }
                 if let Some(offer) = self
                     .file_offer
                     .as_ref()
@@ -564,6 +787,36 @@ impl Service {
             FrontendRequest::PasteFiles { id, destination } => {
                 self.start_file_paste(id, destination)
             }
+            FrontendRequest::ResolveFilePasteConflict {
+                id,
+                request_id,
+                action,
+            } => {
+                let resume_saving =
+                    !matches!(action, mousehop_ipc::FilePasteConflictAction::Cancel);
+                let mut resolved = false;
+                if let Some(active) = self.active_paste.as_mut().filter(|paste| paste.id == id) {
+                    if active
+                        .conflict
+                        .as_ref()
+                        .is_some_and(|pending| pending.question.request_id == request_id)
+                    {
+                        if let Some(pending) = active.conflict.take() {
+                            resolved = pending.reply.send(action).is_ok();
+                        }
+                    }
+                }
+                if resolved && resume_saving {
+                    if let Some(mut progress) = self
+                        .last_file_progress
+                        .clone()
+                        .filter(|progress| progress.id == id)
+                    {
+                        progress.phase = FilePastePhase::Saving;
+                        self.file_paste_progress(progress);
+                    }
+                }
+            }
             FrontendRequest::CancelFilePaste { id } => {
                 if self
                     .active_paste
@@ -578,6 +831,7 @@ impl Service {
                 self.save_config().await;
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
+                self.pending_pairing.remove(&fp);
                 self.add_authorized_key(desc, fp);
                 self.save_config().await;
             }
@@ -590,8 +844,16 @@ impl Service {
                 self.remove_client(handle).await;
                 self.save_config().await;
             }
-            FrontendRequest::EnableCapture => self.capture.reenable(),
-            FrontendRequest::EnableEmulation => self.emulation.reenable(),
+            FrontendRequest::EnableCapture => {
+                if self.sharing {
+                    self.capture.reenable();
+                }
+            }
+            FrontendRequest::EnableEmulation => {
+                if self.sharing {
+                    self.emulation.reenable();
+                }
+            }
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.conn.reset_handle(handle).await;
@@ -620,7 +882,8 @@ impl Service {
                 self.save_config().await;
             }
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
-                self.update_enter_hook(handle, enter_hook)
+                self.update_enter_hook(handle, enter_hook);
+                self.save_config().await;
             }
             FrontendRequest::SaveConfiguration => self.save_config().await,
             FrontendRequest::SetReleaseThreshold(threshold) => {
@@ -737,8 +1000,7 @@ impl Service {
                 self.save_config().await;
             }
             FrontendRequest::ListRunningApps => {
-                let apps = frontmost_app::list_running_apps();
-                self.notify_frontend(FrontendEvent::RunningApps(apps));
+                self.notify_frontend(FrontendEvent::RequestRunningApps);
             }
         }
     }
@@ -992,6 +1254,9 @@ impl Service {
                 }
             }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
+                if self.pending_pairing.len() < 128 {
+                    self.pending_pairing.insert(fingerprint.clone());
+                }
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
             EmulationEvent::Entered {
@@ -1140,6 +1405,9 @@ impl Service {
     /// content (re-arriving via another peer in an N-peer ring)
     /// won't be redundantly re-broadcast.
     async fn handle_local_clipboard_event(&mut self, event: Option<input_capture::CaptureEvent>) {
+        if !self.sharing {
+            return;
+        }
         let Some(event) = event else {
             return;
         };
@@ -1277,50 +1545,8 @@ impl Service {
         if targets.is_empty() {
             return;
         }
-        let payload = if needs_bulk {
-            let source = event.clone();
-            match tokio::task::spawn_blocking(move || {
-                if let ClipboardEvent::Files { paths, .. } = &source {
-                    if !input_capture::clipboard::current_file_copy_matches(paths) {
-                        return Err(crate::clipboard_bulk::BulkTransportError::InvalidPayload(
-                            "File copy expired".into(),
-                        ));
-                    }
-                }
-                #[cfg(windows)]
-                let _access = crate::windows_service::desktop_file_access()?;
-                match source {
-                    ClipboardEvent::Text(content) => OutgoingPayload::text(content),
-                    ClipboardEvent::ImageRgba {
-                        width,
-                        height,
-                        bytes,
-                    } => OutgoingPayload::image_rgba(width, height, bytes),
-                    ClipboardEvent::Files { paths, owned_root } => {
-                        OutgoingPayload::file_tree(paths, owned_root)
-                    }
-                }
-            })
-            .await
-            {
-                Ok(Ok(payload)) => Some(payload),
-                Ok(Err(error)) => {
-                    log::warn!("failed to prepare clipboard payload: {error}");
-                    return;
-                }
-                Err(error) => {
-                    log::warn!("clipboard payload worker failed: {error}");
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        if is_file && input_capture::clipboard::native_clipboard_version() != source_version {
-            return;
-        }
-        for handle in targets {
-            if let Some(content) = legacy.as_ref() {
+        if let Some(content) = legacy.as_ref() {
+            for handle in targets {
                 if let Err(error) = self
                     .conn
                     .send(
@@ -1334,25 +1560,109 @@ impl Service {
                 {
                     log::debug!("clipboard send to client {handle} failed: {error}");
                 }
-                continue;
             }
+            return;
+        }
+        // Archive/file-tree preparation can take seconds. Keep the service
+        // event loop available for input, Agent heartbeats and cancellation.
+        let cancel = self.clipboard_preparations.cancel.clone();
+        self.clipboard_preparations.jobs.spawn(async move {
+            let epoch = cancel.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if let ClipboardEvent::Files { paths, .. } = &event {
+                    if !input_capture::clipboard::current_file_copy_matches(paths) {
+                        return Err(crate::clipboard_bulk::BulkTransportError::InvalidPayload(
+                            "File copy expired".into(),
+                        ));
+                    }
+                }
+                #[cfg(windows)]
+                let _access = crate::windows_service::desktop_file_access()?;
+                match event {
+                    ClipboardEvent::Text(content) => OutgoingPayload::text(content),
+                    ClipboardEvent::ImageRgba {
+                        width,
+                        height,
+                        bytes,
+                    } => OutgoingPayload::image_rgba(width, height, bytes),
+                    ClipboardEvent::Files { paths, owned_root } => {
+                        OutgoingPayload::file_tree(paths, owned_root, &cancel)
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|error| Err(io::Error::other(error).into()));
+            PreparedClipboard {
+                cancel: epoch,
+                targets,
+                origin: from_fingerprint,
+                version: source_version,
+                is_file,
+                capability: required_capability,
+                result,
+            }
+        });
+    }
+
+    async fn clipboard_prepared(&mut self, prepared: PreparedClipboard) {
+        if !prepared.can_publish(
+            self.sharing,
+            self.desktop_available,
+            input_capture::clipboard::native_clipboard_version(),
+        ) {
+            return;
+        }
+        let PreparedClipboard {
+            cancel: _,
+            mut targets,
+            origin: from_fingerprint,
+            version: source_version,
+            is_file,
+            capability,
+            result,
+        } = prepared;
+        if is_file && input_capture::clipboard::native_clipboard_version() != source_version {
+            return;
+        }
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(error) => {
+                log::warn!("failed to prepare clipboard payload: {error}");
+                if is_file {
+                    let progress = FilePasteProgress {
+                        id: rand::random(),
+                        received: 0,
+                        total: 0,
+                        phase: FilePastePhase::Failed,
+                        message: Some(format!("Cannot prepare files for transfer: {error}")),
+                    };
+                    self.last_file_progress = Some(progress.clone());
+                    self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
+                }
+                return;
+            }
+        };
+        let enabled = self.client_manager.clipboard_send_targets();
+        targets.retain(|handle| {
+            enabled.contains(handle)
+                && self.client_manager.alive(*handle)
+                && self.client_manager.peer_capabilities(*handle) & capability == capability
+        });
+        for handle in targets {
             let Some(addr) = self.client_manager.active_addr(handle) else {
                 log::debug!("clipboard-v2 client {handle} has no active address");
                 continue;
             };
-            let transfer = match OutgoingTransfer::bind(
-                addr.ip(),
-                from_fingerprint.clone(),
-                payload.as_ref().expect("bulk payload exists").clone(),
-            )
-            .await
-            {
-                Ok(transfer) => transfer,
-                Err(error) => {
-                    log::warn!("failed to bind clipboard-v2 transfer for {handle}: {error}");
-                    continue;
-                }
-            };
+            let transfer =
+                match OutgoingTransfer::bind(addr.ip(), from_fingerprint.clone(), payload.clone())
+                    .await
+                {
+                    Ok(transfer) => transfer,
+                    Err(error) => {
+                        log::warn!("failed to bind clipboard-v2 transfer for {handle}: {error}");
+                        continue;
+                    }
+                };
             let transfer_id = transfer.offer().offer.transfer_id.0;
             if let Err(error) = self
                 .conn
@@ -1421,21 +1731,15 @@ impl Service {
     }
 
     fn cancel_file_paste(&mut self) {
-        if let Some(paste) = self.active_paste.take() {
-            let progress = FilePasteProgress {
-                id: paste.id,
-                received: 0,
-                total: 0,
-                phase: FilePastePhase::Cancelled,
-                message: None,
-            };
-            drop(paste);
-            self.last_file_progress = Some(progress.clone());
-            self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
+        if let Some(paste) = self.active_paste.as_ref() {
+            // Keep this operation active until its blocking publisher has
+            // restored backups; a new paste must not race that rollback.
+            paste.cancel.cancel();
         }
     }
 
     async fn invalidate_file_transfers(&mut self) {
+        self.clipboard_preparations.cancel();
         self.native_arming = None;
         // Closing the source listener is authoritative even if the revocation
         // datagram is lost: an obsolete offer cannot fetch file contents.
@@ -1457,6 +1761,9 @@ impl Service {
     }
 
     fn start_file_paste(&mut self, id: [u8; 16], destination: std::path::PathBuf) {
+        if !self.sharing || !self.desktop_available || self.desktop_agent_seen.is_none() {
+            return;
+        }
         if self.capture.is_forwarding() {
             self.fail_native_paste(
                 id,
@@ -1489,12 +1796,14 @@ impl Service {
             destination,
             cancel.clone(),
             self.file_progress_tx.clone(),
+            self.file_conflict_tx.clone(),
         ));
         self.active_paste = Some(ActivePaste {
             addr,
             id,
             cancel,
             task,
+            conflict: None,
         });
         // The GUI must know the paste is active before the pending offer is
         // cleared, so its native marker survives until transfer completion.
@@ -1509,6 +1818,32 @@ impl Service {
         self.notify_file_offer();
     }
 
+    fn file_paste_conflict(&mut self, conflict: PendingFileConflict) {
+        let Some(active) = self
+            .active_paste
+            .as_mut()
+            .filter(|paste| paste.id == conflict.question.id)
+        else {
+            return;
+        };
+        let question = conflict.question.clone();
+        active.conflict = Some(conflict);
+        let (received, total) = self
+            .last_file_progress
+            .as_ref()
+            .filter(|progress| progress.id == question.id)
+            .map(|progress| (progress.received, progress.total))
+            .unwrap_or((0, 0));
+        self.file_paste_progress(FilePasteProgress {
+            id: question.id,
+            received,
+            total,
+            phase: FilePastePhase::WaitingForConflict,
+            message: None,
+        });
+        self.notify_frontend(FrontendEvent::FilePasteConflict(question));
+    }
+
     fn file_paste_progress(&mut self, progress: FilePasteProgress) {
         if self
             .active_paste
@@ -1517,14 +1852,18 @@ impl Service {
         {
             return;
         }
-        if matches!(
+        let finished = matches!(
             progress.phase,
             FilePastePhase::Complete | FilePastePhase::Failed | FilePastePhase::Cancelled
-        ) {
+        );
+        if finished {
             self.active_paste.take();
         }
         self.last_file_progress = Some(progress.clone());
         self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
+        if finished {
+            self.notify_file_offer();
+        }
     }
 
     async fn retry_pending_clipboards(&mut self) {
@@ -1723,12 +2062,35 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        for fingerprint in self.pending_pairing.iter().cloned().collect::<Vec<_>>() {
+            self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+        }
+        self.notify_frontend(FrontendEvent::ConfigureAutostartStatus);
+        self.notify_frontend(FrontendEvent::DesktopAvailable(self.desktop_available));
+        self.notify_frontend(FrontendEvent::ProtocolVersion(
+            mousehop_ipc::LOCAL_PROTOCOL_VERSION,
+        ));
+        self.notify_frontend(FrontendEvent::RuntimeState(if self.stopped {
+            mousehop_ipc::RuntimeState::Stopped
+        } else if self.sharing {
+            mousehop_ipc::RuntimeState::Running
+        } else {
+            mousehop_ipc::RuntimeState::Paused
+        }));
         self.notify_frontend(FrontendEvent::InputForwarding(self.capture.is_forwarding()));
         self.notify_file_offer();
         if self.file_offer.is_none() {
             if let Some(progress) = self.last_file_progress.clone() {
                 self.notify_frontend(FrontendEvent::FilePasteProgress(progress));
             }
+        }
+        if let Some(question) = self
+            .active_paste
+            .as_ref()
+            .and_then(|paste| paste.conflict.as_ref())
+            .map(|pending| pending.question.clone())
+        {
+            self.notify_frontend(FrontendEvent::FilePasteConflict(question));
         }
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
@@ -2040,11 +2402,20 @@ impl Service {
     }
 }
 
-/// `tokio::select!` arm helper for the optional [`ClipboardMonitor`].
-/// Resolves to `Some(event)` when the monitor surfaces a change and
-/// to a never-completing future when no monitor is alive — keeping
-/// the surrounding `select!` from busy-spinning when clipboard sync
-/// is unavailable on the host.
+/// Missing or completed permission watchers must not busy-spin Core's loop.
+async fn wait_for_permission_revocation(
+    receiver: &mut Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+) {
+    if let Some(receiver) = receiver.as_mut() {
+        if receiver.recv().await.is_some() {
+            return;
+        }
+    }
+    *receiver = None;
+    std::future::pending::<()>().await;
+}
+
+/// Wait for clipboard changes without busy-spinning when monitoring is absent.
 async fn recv_clipboard(
     monitor: &mut Option<ClipboardMonitor>,
 ) -> Option<input_capture::CaptureEvent> {
@@ -2089,6 +2460,44 @@ async fn recv_desktop_clipboard(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_preparation_cannot_publish_after_pause_desktop_change_or_new_copy() {
+        let preparations = super::ClipboardPreparations::default();
+        let prepared = super::PreparedClipboard {
+            cancel: preparations.cancel.clone(),
+            targets: vec![],
+            origin: String::new(),
+            version: Some(17),
+            is_file: true,
+            capability: 0,
+            result: super::OutgoingPayload::text("archive ready".into()),
+        };
+        assert!(prepared.can_publish(true, true, Some(17)));
+        assert!(!prepared.can_publish(false, true, Some(17)));
+        assert!(!prepared.can_publish(true, false, Some(17)));
+        assert!(!prepared.can_publish(true, true, Some(18)));
+        drop(preparations);
+        assert!(!prepared.can_publish(true, true, Some(17)));
+    }
+
+    #[tokio::test]
+    async fn newer_copy_cancels_pending_preparation_and_shutdown_cancels_archiving() {
+        let mut preparations = super::ClipboardPreparations::default();
+        let previous = preparations.cancel.clone();
+        preparations
+            .jobs
+            .spawn(std::future::pending::<super::PreparedClipboard>());
+        preparations.cancel();
+        assert!(previous.is_cancelled());
+        assert!(!preparations.cancel.is_cancelled());
+        assert!(
+            matches!(preparations.jobs.join_next().await, Some(Err(error)) if error.is_cancelled())
+        );
+        let current = preparations.cancel.clone();
+        drop(preparations);
+        assert!(current.is_cancelled());
+    }
+
     use super::*;
 
     #[test]

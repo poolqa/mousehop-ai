@@ -1,39 +1,8 @@
-//! Windows notification-area ("system tray") icon — keeps the daemon
-//! visible and reachable when the preferences window is closed.
-//!
-//! Mirrors the role of [`crate::linux_tray`] and
-//! [`crate::macos_status_item`]: holds a [`gio::ApplicationHoldGuard`]
-//! so the GtkApplication survives its last window closing, exposes
-//! Open / Quit, and toggles the window on left-click. Before this,
-//! Windows was the one platform with neither a tray nor a menu-bar
-//! item, so closing the window quit the process and took input sharing
-//! with it — the app had to be left on screen to keep working.
-//!
-//! Threading: on Windows [`crate::run`] drives GTK on a dedicated
-//! "gtk" thread, so the hidden window created here belongs to that
-//! thread and its [`wndproc`] is invoked by GDK's Win32 message pump.
-//! Callbacks are therefore already on the GTK thread — but they arrive
-//! *inside* a `DispatchMessage`, and for the context menu inside
-//! `TrackPopupMenu`'s own nested modal loop. Re-entering GTK from
-//! there invites reentrancy bugs, so commands are pushed through an
-//! `async_channel` and applied by a `glib::spawn_future_local` task
-//! once the pump unwinds — the same shape `linux_tray` uses to get off
-//! ksni's thread.
-//!
-//! The icon is owned by a hidden *top-level* window rather than the
-//! cheaper `HWND_MESSAGE`-parented message-only window, because
-//! message-only windows do not receive broadcasts and we need two of
-//! them: `TaskbarCreated` (Explorer restarted and rebuilt the
-//! notification area — re-add the icon or it is gone for good) and
-//! `WM_SETTINGCHANGE` (the user flipped light/dark — re-tint the
-//! glyph).
-
+//! Native Windows tray owned by the background Agent.
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use adw::prelude::*;
-use async_channel::Sender;
-use gtk::{gio, glib};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use windows::Win32::Foundation::{E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -52,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::window::Window;
+use crate::agent::TrayCmd;
 
 /// Private message `Shell_NotifyIcon` posts back to us for mouse
 /// activity on the icon. Any value in `[WM_APP, 0xBFFF]` is ours to
@@ -63,19 +32,16 @@ const WM_MOUSEHOP_TRAY: u32 = WM_APP + 1;
 /// `TPM_RETURNCMD` returns 0 for "dismissed without choosing".
 const IDM_OPEN: usize = 1;
 const IDM_QUIT: usize = 2;
+const IDM_PAUSE: usize = 3;
+const IDM_LOG: usize = 4;
 
 /// Our icon's id within the owning window. There is only ever one, so
 /// the value is arbitrary — it just has to match across add / modify /
 /// delete.
 const TRAY_ICON_ID: u32 = 1;
 
-#[derive(Debug)]
-enum TrayCmd {
-    TogglePresent,
-    Quit,
-}
-
 struct TrayState {
+    status: Option<mousehop_ipc::RuntimeState>,
     hwnd: HWND,
     icon: HICON,
     tx: Sender<TrayCmd>,
@@ -110,50 +76,49 @@ thread_local! {
 /// The returned guard MUST be kept alive for as long as the tray
 /// should run — the call site stashes it in a thread-local, mirroring
 /// the Linux and macOS code.
-pub(crate) fn setup(app: &adw::Application, window: &Window) -> Option<gio::ApplicationHoldGuard> {
-    let hold = app.hold();
-    let (tx, rx) = async_channel::bounded::<TrayCmd>(8);
-
-    if let Err(e) = install(tx) {
-        log::warn!(
-            "windows_tray: could not create the notification-area icon ({e}) — \
-             closing the window will quit Mousehop"
-        );
-        return None;
+pub(crate) struct Tray {
+    rx: Receiver<TrayCmd>,
+}
+impl Tray {
+    pub fn new() -> std::io::Result<Self> {
+        let (tx, rx) = channel();
+        install(tx)?;
+        Ok(Self { rx })
     }
-    log::debug!("windows_tray: notification-area icon registered");
-
-    let app = app.clone();
-    let window = window.clone();
-    glib::spawn_future_local(async move {
-        while let Ok(cmd) = rx.recv().await {
-            match cmd {
-                TrayCmd::TogglePresent => {
-                    let visible = window.is_visible();
-                    log::info!(
-                        "windows_tray: TogglePresent — currently visible={visible}, will {}",
-                        if visible { "hide" } else { "present" }
-                    );
-                    if visible {
-                        window.set_visible(false);
-                    } else {
-                        window.present();
-                    }
-                }
-                TrayCmd::Quit => {
-                    log::debug!("windows_tray: quit requested via tray menu");
-                    // Take the icon down before the loop stops. The
-                    // shell only reaps a dead process's icon lazily —
-                    // often not until the user happens to sweep the
-                    // mouse over the stale one.
-                    shutdown();
-                    app.quit();
-                }
+    pub fn set_state(&self, state: Option<mousehop_ipc::RuntimeState>) {
+        let hwnd = TRAY.with(|tray| {
+            let mut tray = tray.borrow_mut();
+            let tray = tray.as_mut()?;
+            tray.status = state;
+            Some(tray.hwnd)
+        });
+        if let Some(hwnd) = hwnd {
+            let mut data = icon_data(hwnd);
+            data.uFlags = NIF_TIP;
+            write_tip(&mut data.szTip, crate::agent::state_label(state));
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
             }
         }
-    });
-
-    Some(hold)
+    }
+    pub fn poll(&self) -> Option<TrayCmd> {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+            };
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        self.rx.try_recv().ok()
+    }
+}
+impl Drop for Tray {
+    fn drop(&mut self) {
+        shutdown();
+    }
 }
 
 /// Create the owning window and put the icon in the notification area.
@@ -211,6 +176,7 @@ fn install(tx: Sender<TrayCmd>) -> windows::core::Result<()> {
         // owns). With the state unpublished, such a message no-ops.
         TRAY.with(|cell| {
             *cell.borrow_mut() = Some(TrayState {
+                status: None,
                 hwnd,
                 icon,
                 tx,
@@ -340,7 +306,7 @@ fn send(cmd: TrayCmd) {
         // this very thread's main loop, so blocking here would
         // deadlock. Dropping a click when the queue is somehow full is
         // the right trade for a tray.
-        if tray.try_send(cmd).is_err() {
+        if tray.send(cmd).is_err() {
             log::debug!("windows_tray: dropped a tray command (channel full or closed)");
         }
     });
@@ -362,6 +328,17 @@ unsafe fn show_menu(hwnd: HWND) {
     };
 
     unsafe {
+        let status = TRAY.with(|state| state.borrow().as_ref().and_then(|state| state.status));
+        let label: Vec<_> = crate::agent::state_label(status)
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | windows::Win32::UI::WindowsAndMessaging::MF_DISABLED,
+            0,
+            PCWSTR(label.as_ptr()),
+        );
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -374,6 +351,17 @@ unsafe fn show_menu(hwnd: HWND) {
                     .as_ptr(),
             ),
         );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_PAUSE,
+            if matches!(status, Some(mousehop_ipc::RuntimeState::Running)) {
+                w!("Pause sharing")
+            } else {
+                w!("Resume sharing")
+            },
+        );
+        let _ = AppendMenuW(menu, MF_STRING, IDM_LOG, w!("View diagnostic logs"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,
@@ -410,6 +398,8 @@ unsafe fn show_menu(hwnd: HWND) {
         match choice.0 as usize {
             IDM_OPEN => send(TrayCmd::TogglePresent),
             IDM_QUIT => send(TrayCmd::Quit),
+            IDM_PAUSE => send(TrayCmd::ToggleSharing),
+            IDM_LOG => send(TrayCmd::Logs),
             _ => {}
         }
     }

@@ -53,6 +53,7 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ../Cargo.lock;
+  cargoBuildFlags = [ "-p" "mousehop" "-p" "mousehop-gtk" "-p" "mousehop-cli" ];
 
   # Set Environment Variables
   RUST_BACKTRACE = "full";

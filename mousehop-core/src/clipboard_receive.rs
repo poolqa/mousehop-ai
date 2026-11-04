@@ -754,7 +754,12 @@ mod tests {
         let folder = source_dir.path().join("folder");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("hello.txt"), b"hello").unwrap();
-        let payload = OutgoingPayload::file_tree(vec![folder], None).unwrap();
+        let payload = OutgoingPayload::file_tree(
+            vec![folder],
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
         let transfer_offer = offer(ClipboardItemKind::FileTree, 5, 2);
         let transfer_id = transfer_offer.transfer_id;
         let key = BulkKey::generate();

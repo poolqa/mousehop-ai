@@ -58,8 +58,10 @@ modules:
         CARGO_HOME: /run/build/mousehop/cargo
     build-commands:
       - cargo fetch --manifest-path Cargo.toml --verbose
-      - cargo build --release
+      - cargo build --release -p mousehop -p mousehop-gtk -p mousehop-cli
       - install -Dm0755 target/release/mousehop /app/bin/mousehop
+      - install -Dm0755 target/release/mousehop-ui /app/bin/mousehop-ui
+      - install -Dm0755 target/release/mousehop-cli /app/bin/mousehop-cli
       - install -Dm0644 mousehop-gtk/resources/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
       # Render a hicolor PNG ladder from the source SVG so hosts
        # that prefer fixed-size raster icons (older toolkits, certain

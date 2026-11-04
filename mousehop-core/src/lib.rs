@@ -2,12 +2,12 @@ mod capture;
 pub mod capture_test;
 pub mod client;
 mod clipboard_bulk;
+#[cfg(target_os = "macos")]
+mod clipboard_bundle;
 mod clipboard_receive;
 pub mod config;
 mod connect;
 mod crypto;
-#[cfg(all(unix, not(target_os = "macos")))]
-pub mod desktop_install;
 mod discovery;
 mod dns;
 mod emulation;

@@ -2256,11 +2256,40 @@ dependencies = [
 name = "mousehop"
 version = "0.18.0"
 dependencies = [
+ "clap 4.6.0",
+ "embed-resource",
+ "env_logger",
+ "ksni",
+ "libc",
+ "log",
+ "mousehop-cli",
+ "mousehop-core",
+ "mousehop-input-capture",
+ "mousehop-ipc",
+ "mousehop-logging",
+ "thiserror 2.0.18",
+ "tokio",
+ "windows 0.61.3",
+]
+
+[[package]]
+name = "mousehop-cli"
+version = "0.18.0"
+dependencies = [
+ "clap 4.6.0",
+ "futures",
+ "mousehop-ipc",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "mousehop-core"
+version = "0.18.0"
+dependencies = [
  "aes-gcm",
  "clap 4.6.0",
  "core-graphics",
- "embed-resource",
- "env_logger",
  "futures",
  "hostname",
  "if-addrs 0.13.4",
@@ -2270,12 +2299,11 @@ dependencies = [
  "local-channel",
  "log",
  "mdns-sd",
- "mousehop-cli",
- "mousehop-gtk",
  "mousehop-input-capture",
  "mousehop-input-emulation",
  "mousehop-input-event",
  "mousehop-ipc",
+ "mousehop-logging",
  "mousehop-proto",
  "netdev",
  "notify",
@@ -2300,30 +2328,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "mousehop-cli"
-version = "0.18.0"
-dependencies = [
- "clap 4.6.0",
- "futures",
- "mousehop-ipc",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "mousehop-gtk"
 version = "0.18.0"
 dependencies = [
  "async-channel",
+ "embed-resource",
+ "env_logger",
  "glib-build-tools",
  "gtk4",
  "hostname",
- "ksni",
  "libadwaita",
  "log",
- "mousehop-input-capture",
  "mousehop-input-event",
  "mousehop-ipc",
+ "mousehop-logging",
+ "shadow-rs",
  "thiserror 2.0.18",
  "windows 0.61.3",
 ]
@@ -2410,6 +2429,7 @@ dependencies = [
 name = "mousehop-installer"
 version = "0.18.0"
 dependencies = [
+ "sha2",
  "toml 0.8.23",
  "windows 0.61.3",
 ]
@@ -2427,6 +2447,16 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "mousehop-logging"
+version = "0.18.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "tempfile",
+ "time",
 ]
 
 [[package]]

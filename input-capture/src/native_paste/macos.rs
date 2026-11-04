@@ -24,7 +24,7 @@ use std::{ffi::c_void, ptr};
 type Ax = *const c_void;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrusted() -> std::ffi::c_uchar;
     fn AXUIElementCreateSystemWide() -> Ax;
     fn AXUIElementCreateApplication(pid: i32) -> Ax;
     fn AXUIElementCopyAttributeValue(
@@ -388,7 +388,7 @@ pub(super) fn cancel_menu() -> bool {
 }
 
 pub(super) fn start(shared: Arc<Shared>) -> io::Result<()> {
-    if !unsafe { AXIsProcessTrusted() } {
+    if unsafe { AXIsProcessTrusted() } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Mousehop needs Accessibility permission for automatic Finder paste",

@@ -36,6 +36,19 @@ pub enum ConnectionError {
     Timeout,
 }
 
+impl ConnectionError {
+    /// Busy or denied IPC does not mean the runtime is absent.
+    pub fn is_endpoint_missing(&self) -> bool {
+        match self {
+            Self::Io(error) if error.kind() == io::ErrorKind::NotFound => true,
+            // A crashed Unix listener leaves its socket pathname behind.
+            #[cfg(unix)]
+            Self::Io(error) if error.kind() == io::ErrorKind::ConnectionRefused => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum IpcListenerCreationError {
     #[error("could not determine socket-path: `{0}`")]
@@ -595,8 +608,31 @@ pub enum RemoteHostState {
     Unavailable,
 }
 
+pub const LOCAL_PROTOCOL_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeState {
+    Running,
+    Paused,
+    Stopped,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    ProtocolVersion(u32),
+    RuntimeState(RuntimeState),
+    AgentAttached(RuntimeState),
+    OpenSettings,
+    Restart,
+    DesktopAvailable(bool),
+    RequestRunningApps,
+    ConfigureAutostart(bool),
+    ConfigureAutostartStatus,
+    Autostart {
+        enabled: bool,
+        managed: bool,
+        error: Option<String>,
+    },
     InputForwarding(bool),
     PrepareNativeFilePaste {
         id: [u8; 16],
@@ -605,6 +641,7 @@ pub enum FrontendEvent {
     /// Only metadata; no file content is downloaded until PasteFiles.
     FilePasteAvailable(Option<FilePasteOffer>),
     FilePasteProgress(FilePasteProgress),
+    FilePasteConflict(FilePasteConflict),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -696,6 +733,7 @@ pub struct FilePasteOffer {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FilePastePhase {
+    WaitingForConflict,
     Receiving,
     Saving,
     Complete,
@@ -710,6 +748,39 @@ pub struct FilePasteProgress {
     pub total: u64,
     pub phase: FilePastePhase,
     pub message: Option<String>,
+}
+
+/// A conflict belongs to one transfer and one question, never an arbitrary path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilePasteConflict {
+    pub id: [u8; 16],
+    pub request_id: [u8; 16],
+    pub name: String,
+    pub suggested_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FilePasteConflictAction {
+    Replace,
+    Rename(String),
+    Cancel,
+}
+
+/// Renames are a single portable filename, never a destination path.
+pub fn valid_paste_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.ends_with(['.', ' '])
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+        && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// One running-app candidate for the suppression-list picker. The
@@ -732,6 +803,25 @@ pub struct RunningApp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    Hello {
+        version: u32,
+    },
+    SetSharing(bool),
+    Quit,
+    OpenSettings,
+    Restart,
+    DesktopAgentConnected {
+        sharing: bool,
+    },
+    DesktopAgentHeartbeat,
+    DesktopAgentDisconnected,
+    RunningAppsReport(Vec<RunningApp>),
+    SetAutostart(bool),
+    AutostartReport {
+        enabled: bool,
+        managed: bool,
+        error: Option<String>,
+    },
     PrepareNativeFilePaste {
         id: [u8; 16],
     },
@@ -750,6 +840,11 @@ pub enum FrontendRequest {
     },
     CancelFilePaste {
         id: [u8; 16],
+    },
+    ResolveFilePasteConflict {
+        id: [u8; 16],
+        request_id: [u8; 16],
+        action: FilePasteConflictAction,
     },
     /// activate/deactivate client
     Activate(ClientHandle, bool),
@@ -839,6 +934,35 @@ pub enum FrontendRequest {
     /// populated. The daemon replies with a
     /// [`FrontendEvent::RunningApps`].
     ListRunningApps,
+}
+
+impl FrontendRequest {
+    pub fn requires_admin(&self) -> bool {
+        !matches!(
+            self,
+            Self::Hello { .. }
+                | Self::Sync
+                | Self::Enumerate()
+                | Self::ListRunningApps
+                | Self::SetSharing(_)
+                | Self::SetReleaseThreshold(_)
+                | Self::Restart
+                | Self::Quit
+                | Self::OpenSettings
+                | Self::DesktopAgentConnected { .. }
+                | Self::DesktopAgentHeartbeat
+                | Self::DesktopAgentDisconnected
+                | Self::RunningAppsReport(_)
+                | Self::SetAutostart(_)
+                | Self::AutostartReport { .. }
+                | Self::PrepareNativeFilePaste { .. }
+                | Self::NativeFilePastePrepared { .. }
+                | Self::NativeFilePasteFailed { .. }
+                | Self::PasteFiles { .. }
+                | Self::CancelFilePaste { .. }
+                | Self::ResolveFilePasteConflict { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -1072,3 +1196,125 @@ mod tests {
 pub mod desktop;
 #[cfg(windows)]
 pub mod windows;
+
+/// Stable hexadecimal encoding used only to select a local transfer window.
+pub fn encode_transfer_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+pub fn decode_transfer_id(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32 || !value.is_ascii() {
+        return None;
+    }
+    let mut id = [0; 16];
+    for (index, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(id)
+}
+
+#[cfg(test)]
+mod runtime_control_tests {
+    use super::*;
+    #[test]
+    fn desktop_access_does_not_grant_machine_configuration() {
+        for request in [
+            FrontendRequest::SetSharing(false),
+            FrontendRequest::SetReleaseThreshold(60),
+            FrontendRequest::Quit,
+            FrontendRequest::Restart,
+            FrontendRequest::SetAutostart(true),
+            FrontendRequest::Sync,
+            FrontendRequest::DesktopAgentConnected { sharing: true },
+        ] {
+            assert!(!request.requires_admin());
+        }
+        for request in [
+            FrontendRequest::Create,
+            FrontendRequest::AuthorizeKey("peer".into(), "fingerprint".into()),
+            FrontendRequest::UpdateEnterHook(0, Some("command".into())),
+            FrontendRequest::ChangePort(1234),
+            FrontendRequest::SaveConfiguration,
+            FrontendRequest::SetIncomingPeerClipboardReceive("peer".into(), true),
+        ] {
+            assert!(request.requires_admin());
+        }
+    }
+    #[test]
+    fn transfer_window_identifier_rejects_paths_and_truncated_values() {
+        let id = [0x9a; 16];
+        assert_eq!(decode_transfer_id(&encode_transfer_id(&id)), Some(id));
+        for value in [
+            "../settings",
+            "1234",
+            "gggggggggggggggggggggggggggggggg",
+            "中文字中文字中文字中文字",
+        ] {
+            assert!(decode_transfer_id(value).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[test]
+    fn busy_and_denied_pipes_must_not_bootstrap_another_runtime() {
+        for code in [231, 5, -2147024891] {
+            assert!(!ConnectionError::Io(io::Error::from_raw_os_error(code)).is_endpoint_missing());
+        }
+        assert!(!ConnectionError::Timeout.is_endpoint_missing());
+        assert!(
+            ConnectionError::Io(io::Error::from(io::ErrorKind::NotFound)).is_endpoint_missing()
+        );
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+    #[test]
+    fn renames_are_portable_single_names() {
+        for name in ["report (2).txt", "照片.jpg", "folder"] {
+            assert!(valid_paste_name(name));
+        }
+        for name in [
+            "", ".", "..", "../file", "a/b", "a\\b", "C:foo", "CON.txt", "COM1", "name.", "name ",
+            "a?b",
+        ] {
+            assert!(!valid_paste_name(name), "{name}");
+        }
+    }
+    #[test]
+    fn conflict_response_binds_both_transfer_and_question() {
+        let request = FrontendRequest::ResolveFilePasteConflict {
+            id: [1; 16],
+            request_id: [2; 16],
+            action: FilePasteConflictAction::Rename("report (2).txt".into()),
+        };
+        assert!(!request.requires_admin());
+        let value = serde_json::to_string(&request).unwrap();
+        let decoded: FrontendRequest = serde_json::from_str(&value).unwrap();
+        assert!(
+            matches!(decoded, FrontendRequest::ResolveFilePasteConflict { id, request_id, action: FilePasteConflictAction::Rename(name) } if id == [1; 16] && request_id == [2; 16] && name == "report (2).txt")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stale_endpoint_tests {
+    use super::*;
+    #[test]
+    fn refused_unix_socket_is_absent_but_denied_or_busy_is_not() {
+        assert!(
+            ConnectionError::Io(io::Error::from(io::ErrorKind::ConnectionRefused))
+                .is_endpoint_missing()
+        );
+        assert!(
+            !ConnectionError::Io(io::Error::from(io::ErrorKind::PermissionDenied))
+                .is_endpoint_missing()
+        );
+        assert!(
+            !ConnectionError::Io(io::Error::from(io::ErrorKind::WouldBlock)).is_endpoint_missing()
+        );
+    }
+}

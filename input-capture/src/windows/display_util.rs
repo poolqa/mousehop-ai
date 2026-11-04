@@ -1,6 +1,18 @@
 use windows::Win32::Foundation::RECT;
 
 use crate::Position;
+use input_event::display::DisplayLayout;
+
+pub(crate) fn layout(displays: &[RECT]) -> DisplayLayout {
+    DisplayLayout::new(displays.iter().filter_map(|rect| {
+        Some((
+            rect.left,
+            rect.top,
+            u32::try_from(rect.right.checked_sub(rect.left)?).ok()?,
+            u32::try_from(rect.bottom.checked_sub(rect.top)?).ok()?,
+        ))
+    }))
+}
 
 fn is_within_dp_region(point: (i32, i32), display: &RECT) -> bool {
     [
@@ -60,14 +72,26 @@ pub(crate) fn entered_barrier(
     curr_pos: (i32, i32),
     displays: &[RECT],
 ) -> Option<Position> {
-    [
+    let crossed = [
         Position::Left,
         Position::Right,
         Position::Top,
         Position::Bottom,
     ]
     .into_iter()
-    .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos))
+    .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos));
+    if crossed.is_some() {
+        return crossed;
+    }
+    if !displays.iter().any(|rect| {
+        curr_pos.0 == rect.left
+            || curr_pos.0 == rect.right - 1
+            || curr_pos.1 == rect.top
+            || curr_pos.1 == rect.bottom - 1
+    }) {
+        return None;
+    }
+    crate::windows_pointer::touched_barrier(&layout(displays), prev_pos, curr_pos)
 }
 
 ///

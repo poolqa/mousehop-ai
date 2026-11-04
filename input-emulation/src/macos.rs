@@ -485,7 +485,7 @@ mod permission_tests {
 fn request_accessibility_permission() -> bool {
     // Silent check. The GUI owns the one-time user-visible prompt at
     // startup (see mousehop_gtk::macos_privacy).
-    unsafe { AXIsProcessTrusted() }
+    unsafe { AXIsProcessTrusted() != 0 }
 }
 
 fn request_input_control_permission() -> bool {
@@ -499,7 +499,7 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrusted() -> std::ffi::c_uchar;
 }
 
 #[link(name = "IOKit", kind = "framework")]

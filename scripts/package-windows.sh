@@ -17,8 +17,9 @@ Usage: $(basename "$0") [--runtime-zip PATH] [--output PATH]
 
 Options:
   --runtime-zip PATH  Existing Mousehop Windows ZIP used as the GTK runtime.
-                      If omitted, the newest dist/*windows*x86_64.zip is used.
-                      When none exists, the latest official release is cached.
+                      Imports this ZIP into the dependency cache for later builds.
+                      Otherwise reuse target/windows-package-cache/;
+                      download the latest official release only if uncached.
   --output PATH       ZIP output path
                       (default: dist/mousehop-windows-x86_64.zip)
   -h, --help          Show this help
@@ -29,7 +30,7 @@ Required one-time tools:
 
 The runtime ZIP supplies Windows GTK/libadwaita DLLs. The script recreates the
 MSVC import libraries on the Mac, builds the current source with cargo-xwin,
-then replaces only mousehop.exe in a fresh runtime directory.
+then packages the runtime, UI, and CLI executables in a fresh runtime directory.
 EOF
 }
 
@@ -105,21 +106,19 @@ fi
 
 mkdir -p "$cache_dir" "$(dirname "$output")"
 
+cached_runtime="$cache_dir/mousehop-windows-runtime.zip"
 if [[ -z "$runtime_zip" ]]; then
-    newest_runtime="$(find "$repo_root/dist" -maxdepth 1 -type f -name '*windows*x86_64.zip' -print 2>/dev/null \
-        | while IFS= read -r file; do printf '%s\t%s\n' "$(stat -f '%m' "$file")" "$file"; done \
-        | sort -nr | head -1 | cut -f2- || true)"
-    if [[ -n "$newest_runtime" ]]; then
-        runtime_zip="$newest_runtime"
-    else
+    runtime_zip="$cached_runtime"
+    if [[ ! -f "$runtime_zip" ]]; then
         require_command curl
-        runtime_zip="$cache_dir/mousehop-windows-runtime.zip"
-        if [[ ! -f "$runtime_zip" ]]; then
-            echo "==> Downloading the latest official Windows GTK runtime"
-            curl --fail --location --retry 3 \
-                --output "$runtime_zip" \
-                "https://github.com/jondkinney/mousehop/releases/latest/download/mousehop-windows-x86_64.zip"
-        fi
+        echo "==> Downloading the latest official Windows GTK runtime"
+        curl --fail --location --retry 3 \
+            --output "$runtime_zip.partial" \
+            "https://github.com/jondkinney/mousehop/releases/latest/download/mousehop-windows-x86_64.zip"
+        unzip -tq "$runtime_zip.partial" >/dev/null
+        mv -f "$runtime_zip.partial" "$runtime_zip"
+    else
+        echo "==> Reusing cached Windows GTK runtime"
     fi
 fi
 
@@ -129,8 +128,15 @@ if [[ ! -f "$runtime_zip" ]]; then
 fi
 
 runtime_zip="$(cd "$(dirname "$runtime_zip")" && pwd)/$(basename "$runtime_zip")"
+if [[ "$runtime_zip" != "$cached_runtime" ]]; then
+    echo "==> Caching Windows GTK runtime from $(basename "$runtime_zip")"
+    cp -f "$runtime_zip" "$cached_runtime.partial"
+    unzip -tq "$cached_runtime.partial" >/dev/null
+    mv -f "$cached_runtime.partial" "$cached_runtime"
+    runtime_zip="$cached_runtime"
+fi
 runtime_hash="$(shasum -a 256 "$runtime_zip" | awk '{print $1}')"
-prefix_schema="1"
+prefix_schema="2"
 prefix_identity="$prefix_schema:$runtime_hash"
 prefix="$cache_dir/gtk-prefix"
 prefix_stamp="$prefix/.runtime-sha256"
@@ -140,7 +146,9 @@ prepare_prefix() {
     local def_dir="$cache_dir/defs"
     local dll_source
     local lib_name
+    local dll_names
     local dll_name
+    local -a dll_candidates
     local dll_path
     local def_path
     local exports
@@ -157,11 +165,18 @@ prepare_prefix() {
     dll_source="$(dirname "$dll_source")"
     find "$dll_source" -maxdepth 1 -type f -name '*.dll' -exec cp -f {} "$prefix/bin/" \;
 
-    while IFS='|' read -r lib_name dll_name; do
+    while IFS='|' read -r lib_name dll_names; do
         [[ -n "$lib_name" ]] || continue
-        dll_path="$prefix/bin/$dll_name"
-        if [[ ! -f "$dll_path" ]]; then
-            echo "error: required GTK runtime library is missing: $dll_name" >&2
+        IFS=' ' read -r -a dll_candidates <<< "$dll_names"
+        dll_path=""
+        for dll_name in "${dll_candidates[@]}"; do
+            if [[ -f "$prefix/bin/$dll_name" ]]; then
+                dll_path="$prefix/bin/$dll_name"
+                break
+            fi
+        done
+        if [[ -z "$dll_path" ]]; then
+            echo "error: required GTK runtime library is missing (expected one of: $dll_names)" >&2
             exit 1
         fi
         def_path="$def_dir/$lib_name.def"
@@ -190,7 +205,7 @@ graphene-1.0|graphene-1.0-0.dll
 gio-2.0|gio-2.0-0.dll
 gobject-2.0|gobject-2.0-0.dll
 glib-2.0|glib-2.0-0.dll
-intl|intl.dll
+intl|intl.dll intl-8.dll libintl-8.dll
 EOF
 
     # gtk-rs build scripts query pkg-config for these package names. Headers
@@ -226,7 +241,7 @@ PKG_CONFIG_ALLOW_CROSS_x86_64_pc_windows_msvc=1 \
 PKG_CONFIG_LIBDIR_x86_64_pc_windows_msvc="$prefix/lib/pkgconfig" \
 PKG_CONFIG_PATH_x86_64_pc_windows_msvc="$prefix/lib/pkgconfig" \
 RC_x86_64_pc_windows_msvc="$llvm_rc" \
-cargo xwin build --release --target "$target" -p mousehop
+cargo xwin build --release --target "$target" -p mousehop -p mousehop-gtk -p mousehop-cli
 
 exe="$repo_root/target/$target/release/mousehop.exe"
 if [[ ! -f "$exe" ]]; then
@@ -240,6 +255,8 @@ rm -rf "$staging_root"
 mkdir -p "$staging_dir"
 cp -f "$prefix/bin/"*.dll "$staging_dir/"
 cp -f "$exe" "$staging_dir/mousehop.exe"
+cp -f "$repo_root/target/$target/release/mousehop-ui.exe" "$staging_dir/"
+cp -f "$repo_root/target/$target/release/mousehop-cli.exe" "$staging_dir/"
 
 echo "==> Creating Windows ZIP"
 rm -f "$output"

@@ -110,11 +110,9 @@ pub(crate) fn language() -> Language {
 
 pub(crate) fn translate(message: &str, language: Language) -> &str {
     if language == Language::TraditionalChinese {
-        for line in CATALOG.lines() {
-            if let Some((key, value)) = line.split_once('\t') {
-                if key == message {
-                    return value;
-                }
+        for (key, value) in crate::translation_catalog::entries(CATALOG) {
+            if key == message {
+                return value;
             }
         }
     }
@@ -179,8 +177,7 @@ mod tests {
     #[test]
     fn catalog_keys_are_unique_and_nonempty() {
         let mut keys = std::collections::HashSet::new();
-        for line in CATALOG.lines() {
-            let (key, value) = line.split_once('\t').expect("key and translation");
+        for (key, value) in crate::translation_catalog::entries(CATALOG) {
             assert!(keys.insert(key), "duplicate {key}");
             assert!(!value.is_empty());
             let placeholders = |s: &str| {

@@ -226,7 +226,6 @@ impl ClipboardPrivacyWindow {
         self.empty_placeholder.set_visible(false);
         self.entries_list.set_visible(true);
         for value in apps.iter() {
-            self.ensure_metadata_for(value);
             let metadata = self.metadata.borrow();
             let entry = metadata.get(value);
             let title = entry
@@ -259,33 +258,6 @@ impl ClipboardPrivacyWindow {
             row.add_suffix(&delete);
             self.entries_list.append(&row);
         }
-    }
-
-    /// Make sure the metadata cache has an entry for `identifier`.
-    /// Cache hits are free; misses query Launch Services via
-    /// `input_capture::frontmost_app::lookup_app_metadata` to find
-    /// the .app on disk, derive a display name + icon, and store
-    /// the result. If the identifier doesn't resolve (uninstalled
-    /// app, unsupported platform), no entry is inserted and the
-    /// caller falls back to displaying the raw identifier.
-    fn ensure_metadata_for(&self, identifier: &str) {
-        if self.metadata.borrow().contains_key(identifier) {
-            return;
-        }
-        let Some(app) = input_capture::frontmost_app::lookup_app_metadata(identifier) else {
-            return;
-        };
-        let icon = app.icon_png.as_ref().and_then(|bytes| {
-            let glib_bytes = glib::Bytes::from(bytes);
-            gdk::Texture::from_bytes(&glib_bytes).ok()
-        });
-        self.metadata.borrow_mut().insert(
-            identifier.to_owned(),
-            AppMetadata {
-                display_name: app.display_name,
-                icon,
-            },
-        );
     }
 
     /// True when the picker's popover is currently presented to

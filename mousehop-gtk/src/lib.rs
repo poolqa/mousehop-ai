@@ -1,3 +1,6 @@
+mod transfer_ui;
+mod translation_catalog;
+pub use transfer_ui::run_transfer;
 mod authorization_window;
 mod client_object;
 mod client_row;
@@ -8,8 +11,6 @@ mod glyph_font;
 mod i18n;
 mod key_object;
 mod key_row;
-#[cfg(target_os = "linux")]
-mod linux_tray;
 mod lock_recovery_window;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
@@ -17,11 +18,10 @@ mod macos_privacy;
 mod macos_status_item;
 mod modal_keys;
 mod release_shortcut;
+mod release_threshold;
 mod running_app_object;
 mod single_instance;
 mod window;
-#[cfg(windows)]
-mod windows_tray;
 
 use std::{env, process, str, sync::OnceLock};
 
@@ -87,6 +87,29 @@ use thiserror::Error;
 pub enum GtkError {
     #[error("gtk frontend exited with non zero exit code: {0}")]
     NonZeroExitCode(i32),
+    #[error("could not initialize GTK: {0}")]
+    Initialization(#[from] glib::BoolError),
+    #[error("could not register the settings application: {0}")]
+    Registration(#[from] glib::Error),
+}
+
+/// Construct preferences without connecting to Core or starting input backends.
+/// Used by the packaged UI's `--check-template` diagnostic on a graphical host.
+pub fn validate_settings_template() -> Result<(), GtkError> {
+    #[cfg(target_os = "macos")]
+    configure_macos_bundle_environment();
+    adw::init()?;
+    register_resources();
+    let app = Application::builder()
+        .application_id("com.mousehop.Mousehop.TemplateCheck")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE)?;
+    let window: Window = glib::Object::builder()
+        .property("application", &app)
+        .build();
+    window.close();
+    Ok(())
 }
 
 /// Arm a process-level force-exit backstop and request a normal app
@@ -173,13 +196,7 @@ fn gtk_main() -> glib::ExitCode {
         install_macos_gtk_log_filter();
     }
 
-    if i18n::language() == i18n::Language::TraditionalChinese {
-        gio::resources_register_include!("mousehop-zh-TW.gresource")
-            .expect("Failed to register resources.");
-    } else {
-        gio::resources_register_include!("mousehop.gresource")
-            .expect("Failed to register resources.");
-    }
+    register_resources();
 
     let app = Application::builder()
         .application_id("com.mousehop.Mousehop")
@@ -214,6 +231,8 @@ fn gtk_main() -> glib::ExitCode {
     });
 
     app.connect_startup(|app| {
+        #[cfg(target_os = "macos")]
+        macos_status_item::configure_accessory();
         load_icons();
         load_styles();
         configure_text_rendering();
@@ -239,6 +258,16 @@ fn gtk_main() -> glib::ExitCode {
 
     let args: Vec<&'static str> = vec![];
     app.run_with_args(&args)
+}
+
+fn register_resources() {
+    if i18n::language() == i18n::Language::TraditionalChinese {
+        gio::resources_register_include!("mousehop-zh-TW.gresource")
+            .expect("Failed to register resources.");
+    } else {
+        gio::resources_register_include!("mousehop.gresource")
+            .expect("Failed to register resources.");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -353,9 +382,7 @@ fn setup_actions(app: &adw::Application) {
         move |_, _| {
             #[cfg(target_os = "macos")]
             request_quit_with_backstop(&app);
-            #[cfg(target_os = "linux")]
-            linux_tray::quit(&app);
-            #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "macos"))]
             app.quit();
         }
     });
@@ -462,7 +489,15 @@ async fn reconnect_ipc(window: &Window, sender: &async_channel::Sender<IpcMsg>) 
 
 fn build_ui(app: &Application) {
     log::debug!("connecting to mousehop-socket");
-    let (reader, writer) = match mousehop_ipc::connect() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let connection = loop {
+        match mousehop_ipc::connect_once() {
+            Ok(connection) => break Ok(connection),
+            Err(error) if std::time::Instant::now() >= deadline => break Err(error),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    let (reader, writer) = match connection {
         Ok(conn) => conn,
         Err(e) => {
             log::error!("{e}");
@@ -495,99 +530,25 @@ fn build_ui(app: &Application) {
     spawn_ipc_reader(reader, sender.clone());
 
     let window = Window::new(app, writer);
-    #[cfg(target_os = "linux")]
-    {
-        // Hide-on-close: the X button, GTK's `window.close` action
-        // (bound to Super+W above), and any WM-level close request
-        // (Hyprland's Super+W if mapped, an `hyprctl dispatch
-        // killactive`, etc.) all funnel through `close-request`.
-        // Returning `Stop` keeps the GtkWindow alive so the tray's
-        // "Open Mousehop" can re-present it without rebuilding state.
-        window.connect_close_request(|window| {
-            window.set_visible(false);
-            glib::Propagation::Stop
-        });
-        // Stash the hold guard for the lifetime of the process so the
-        // GtkApplication does not exit when the last visible window
-        // closes — the tray needs to outlive the GUI.
-        thread_local! {
-            static TRAY_HOLD: std::cell::OnceCell<gio::ApplicationHoldGuard> =
-                const { std::cell::OnceCell::new() };
+    // Preferences owns no tray, desktop hooks or background lifetime.
+    window.connect_close_request(|window| {
+        if let Some(app) = window.application() {
+            app.quit();
         }
-        let hold = linux_tray::setup(app, &window);
-        TRAY_HOLD.with(|cell| {
-            let _ = cell.set(hold);
-        });
-    }
-    #[cfg(windows)]
-    {
-        // Same hide-on-close deal as Linux, but wired up only once the
-        // notification-area icon actually exists: hiding the window
-        // with no tray to re-present it from would leave a running
-        // process the user has no way back to. `windows_tray::setup`
-        // returns `None` in that case and the X button keeps its
-        // default close-and-quit behaviour.
-        thread_local! {
-            static TRAY_HOLD: std::cell::OnceCell<gio::ApplicationHoldGuard> =
-                const { std::cell::OnceCell::new() };
-        }
-        if let Some(hold) = windows_tray::setup(app, &window) {
-            window.connect_close_request(|window| {
-                window.set_visible(false);
-                glib::Propagation::Stop
-            });
-            TRAY_HOLD.with(|cell| {
-                let _ = cell.set(hold);
-            });
-        }
-    }
+        glib::Propagation::Proceed
+    });
     #[cfg(target_os = "macos")]
     {
-        window.connect_close_request(|window| {
-            window.set_visible(false);
-            glib::Propagation::Stop
-        });
-        // Toggle the Dock icon based on the window's visibility:
-        // Regular while the window is open (Dock icon shown so the
-        // user has a familiar way back to the app), Accessory while
-        // the window is hidden and only the menu-bar item is around
-        // (matches the LSUIElement-style background-helper feel).
-        window.connect_show(|_| {
-            macos_status_item::set_activation_policy(macos_status_item::ACTIVATION_POLICY_REGULAR);
-        });
-        window.connect_hide(|_| {
-            macos_status_item::set_activation_policy(
-                macos_status_item::ACTIVATION_POLICY_ACCESSORY,
-            );
-        });
-        macos_status_item::setup(app, &window);
-        // First-launch TCC prompts. No-op when already granted.
+        window.connect_show(|_| macos_status_item::activate_window());
         macos_privacy::fire_initial_prompts();
-        // Watch the Accessibility grant continuously for the lifetime
-        // of the process. On a grant, swap the warning row into its
-        // "relaunch required" state (its capture/emulation backends were
-        // created without permission and need a restart) and present the
-        // modal relaunch prompt — this transition is the one
-        // unambiguous "relaunch needed" moment. On a REVOKE, quit
-        // immediately — an active CGEventTap at HeadInsertEventTap can
-        // wedge system input if the process lingers after losing AX,
-        // and forcing the process to exit is the only bulletproof way
-        // to guarantee the kernel tears the tap down.
-        let window_weak = window.downgrade();
-        let app_weak = app.downgrade();
-        macos_privacy::watch_accessibility_state(move |change| match change {
-            macos_privacy::AccessibilityChange::Granted => {
-                if let Some(window) = window_weak.upgrade() {
-                    window.present();
-                    window.refresh_capture_emulation_status();
-                    window.show_relaunch_required_dialog();
-                }
-            }
-            macos_privacy::AccessibilityChange::Revoked => {
-                log::warn!("Accessibility revoked — quitting to avoid wedging system input");
-                if let Some(app) = app_weak.upgrade() {
-                    request_quit_with_backstop(&app);
-                }
+        let weak = window.downgrade();
+        macos_privacy::watch_accessibility_state(move |change| {
+            if let Some(window) = weak.upgrade() {
+                // Permissions apply to a fresh app session. Refresh the
+                // Restart guidance without repeatedly creating protected
+                // backends while the user edits/removes TCC entries.
+                let _ = change;
+                window.refresh_capture_emulation_status();
             }
         });
     }
@@ -615,17 +576,40 @@ fn build_ui(app: &Application) {
                     Err(_) => process::exit(1),
                 };
                 match notify {
-                    FrontendEvent::InputForwarding(forwarding) => {
-                        window.native_paste_forwarding(forwarding)
+                    FrontendEvent::ProtocolVersion(version) => {
+                        if version != mousehop_ipc::LOCAL_PROTOCOL_VERSION {
+                            window.show_toast("Mousehop UI and background versions differ; update the complete application.");
+                            window.disconnect_frontend();
+                            if let Some(app) = window.application() {
+                                app.quit();
+                            }
+                            break;
+                        }
                     }
-                    FrontendEvent::PrepareNativeFilePaste {
-                        id,
-                        clipboard_version,
-                    } => window.prepare_native_file_paste(id, clipboard_version),
+                    FrontendEvent::RuntimeState(mousehop_ipc::RuntimeState::Stopped) => {
+                        if let Some(app) = window.application() {
+                            app.quit();
+                        }
+                        break;
+                    }
+                    FrontendEvent::RuntimeState(state) => window.set_runtime_state(state),
+                    FrontendEvent::Autostart {
+                        enabled,
+                        managed,
+                        error,
+                    } => window.set_autostart(enabled, managed, error),
+                    FrontendEvent::FilePasteConflict(_)
+                    | FrontendEvent::Restart
+                    | FrontendEvent::ConfigureAutostart(_)
+                    | FrontendEvent::ConfigureAutostartStatus
+                    | FrontendEvent::AgentAttached(_)
+                    | FrontendEvent::OpenSettings
+                    | FrontendEvent::DesktopAvailable(_)
+                    | FrontendEvent::RequestRunningApps
+                    | FrontendEvent::InputForwarding(_)
+                    | FrontendEvent::PrepareNativeFilePaste { .. }
+                    | FrontendEvent::FilePasteProgress(_) => {}
                     FrontendEvent::FilePasteAvailable(offer) => window.file_paste_available(offer),
-                    FrontendEvent::FilePasteProgress(progress) => {
-                        window.file_paste_progress(progress)
-                    }
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)
                     }

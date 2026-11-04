@@ -1032,6 +1032,18 @@ async fn ping_pong(
     }
 }
 
+/// Capture can stop before the network receive tasks finish shutting down.
+fn forward_connection_event(
+    tx: &Sender<MousehopConnectionEvent>,
+    event: MousehopConnectionEvent,
+) -> bool {
+    if tx.send(event).is_err() {
+        log::debug!("Capture event receiver closed; ending network receive task");
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
@@ -1113,29 +1125,39 @@ async fn receive_loop(
                 // match `get_client(addr)`, which fails when
                 // Mac dials in before Linux's outbound dial
                 // has populated `active_addr`.
-                tx.send(MousehopConnectionEvent::Received {
-                    handle,
-                    addr,
-                    session,
-                    event: ProtoEvent::Hello {
-                        magic,
-                        commit,
-                        capabilities,
+                if !forward_connection_event(
+                    &tx,
+                    MousehopConnectionEvent::Received {
+                        handle,
+                        addr,
+                        session,
+                        event: ProtoEvent::Hello {
+                            magic,
+                            commit,
+                            capabilities,
+                        },
                     },
-                })
-                .expect("channel closed");
+                ) {
+                    break;
+                }
             }
-            event => tx
-                .send(MousehopConnectionEvent::Received {
-                    handle,
-                    addr,
-                    session,
-                    event,
-                })
-                .expect("channel closed"),
+            event => {
+                if !forward_connection_event(
+                    &tx,
+                    MousehopConnectionEvent::Received {
+                        handle,
+                        addr,
+                        session,
+                        event,
+                    },
+                ) {
+                    break;
+                }
+            }
         }
     }
     log::debug!("{addr}: receive loop ended");
+    let _ = conn.close().await;
     disconnect(
         &client_manager,
         handle,
@@ -1246,6 +1268,21 @@ fn clear_session_ping_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_network_event_after_capture_shutdown_does_not_panic() {
+        let (tx, rx) = channel();
+        drop(rx);
+        assert!(!forward_connection_event(
+            &tx,
+            MousehopConnectionEvent::Received {
+                handle: 0,
+                addr: "127.0.0.1:4252".parse().unwrap(),
+                session: 1,
+                event: ProtoEvent::Ping,
+            }
+        ));
+    }
+
     use input_event::{Event, KeyboardEvent, PointerEvent, display::DisplayLayout};
 
     fn connection_map() -> Mutex<HashMap<SocketAddr, ConnectionSlot>> {

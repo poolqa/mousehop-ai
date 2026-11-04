@@ -19,13 +19,17 @@ Bulk receivers must validate `TransferLimits` before accepting an offer, write
 file chunks into a transfer-specific staging directory, verify item digests,
 and decode text/images only after the whole transfer completes. File offers
 are handled by `mousehop::file_paste`: receiving an offer must not connect to
-the bulk port. The user-session GUI prepares a protected local marker solely
+the bulk port. The user-session Agent prepares a protected local marker solely
 to enable the file manager's native Paste command; it is never a received file.
 A captured native paste produces a frontend `PasteFiles` request binding the
 exact transfer ID to the confirmed file-manager destination folder. The
 one-shot stream opens only for that request. Verified files are then copied
 with create-new semantics, retaining a rollback list of only paths created by
-this paste; existing names and symlinks are never overwritten. Cancellation
+this paste. Existing names require a transfer-specific Replace/Rename/Cancel
+decision before publication. Replacement moves the existing item into a private
+same-directory backup until the entire paste commits; rollback restores it using
+a non-overwriting move. Directory replacement replaces the entire directory;
+destination symbolic links are moved as entries and never traversed. Cancellation
 also removes partial output created by the operation. Manifest paths are normalized relative `/` paths; absolute
 paths, traversal components, Windows drive roots, and backslashes are rejected
 by the protocol codec. Symbolic links and special filesystem entries are not
@@ -58,15 +62,14 @@ not attempt to inspect the user process's OLE marker. Its own clipboard mutation
 therefore does not revoke the offer. Markers cannot be read as file
 contents and clipboard capture ignores them. Markers are cleared only while the
 clipboard still has the exact generation Mousehop published, preserving a newer
-user copy. The GUI opens an independent progress/cancel window without exposing
+user copy. The Agent starts an independent progress/cancel UI process without exposing
 the settings window. Each new paste raises that popup, even if the previous
 completed popup remains open behind another application. macOS activates the
-app and exposes its Dock icon until the last visible window closes; Windows
+popup in accessory mode without adding a Dock icon; Settings uses the same mode.
+Both GUI processes restore this policy after GTK startup/presentation. Windows
 briefly raises the popup above normal windows without leaving it always on top.
 Periodic progress updates do not take focus again. A successful result closes
-automatically after two seconds; failed/cancelled results remain visible. Each
-progress update invalidates previous completion timers, so an earlier paste
-cannot close the window while a newer transfer is running. Completion means
+immediately; failed/cancelled results remain visible. Completion means
 destination files have been written, not
 merely received into staging. No FUSE or shell extension is installed.
 Windows blocking filesystem work impersonates the logged-in user's limited
@@ -76,7 +79,7 @@ before its pooled thread is reused. OLE clipboard reads continue to require
 the separate user process described below.
 
 The transport implementation is split between
-`mousehop::clipboard_bulk` and `mousehop::clipboard_receive`. Bulk frames use
+`mousehop_core::clipboard_bulk` and `mousehop_core::clipboard_receive`. Bulk frames use
 u32 length prefixes over a reliable byte stream and AES-256-GCM with a
 one-transfer key delivered by the authenticated control channel. Nonces are
 domain-separated by stream direction and monotonically sequenced; the transfer
@@ -181,6 +184,28 @@ the standardized event format.
 The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client.
 
+Native menus must not stall input sharing. Frontend IPC uses a separate bounded
+writer queue per connection; a frontend that stops reading is disconnected on
+overflow without blocking Core or other frontends. Windows desktop-helper input
+and Destroy commands await queue capacity in order, rather than dropping button
+releases during motion bursts. Held mouse buttons are tracked per emulation
+handle and released when that handle leaves or disconnects. Windows defers edge
+capture while a local mouse button is down, a window owns mouse capture, or the
+foreground thread is tracking a menu or moving/resizing a window. A failed
+capture-Begin enqueue leaves the pointer local.
+
+Windows keeps local key gestures balanced across crossings: a key-down delivered
+before capture has its physical key-up passed to local Windows as well as the
+peer. Remote-only key gestures remain captured. Windows capture sends aggregate
+modifier state after modifier transitions and before mouse buttons; macOS mouse
+buttons similarly carry a fresh modifier snapshot before the click. These repair
+lost releases without clearing a modifier group still reported held. Command/Ctrl
+alias tracking also consumes cleared snapshots so the next shortcut can begin.
+The Windows injection backend retains its own per-key ownership and failed key-up
+obligations. It retries only those releases on later input/snapshots and cleanup,
+without blocking/retry loops or blanket resets of all system modifiers. Shared
+key tracking commits only after backend success; failed cleanup retains its keys.
+
 ### macOS Caps Lock
 
 Quartz-injected Caps Lock events do not reliably enter the hardware-only path
@@ -284,6 +309,14 @@ as well as the installed application.
 
 Build on macOS with `scripts/package-windows-installer.sh`. Prerequisites are the
 existing `package-windows.sh` cross-build tools and NSIS (`brew install nsis`).
+The runtime ZIP may provide gettext as `intl.dll`, `intl-8.dll`, or
+`libintl-8.dll`. Import-library generation preserves the actual DLL filename;
+these variants do not require installing another gettext dependency.
+Downloaded or explicitly supplied runtime ZIPs are retained under
+`target/windows-package-cache/`, alongside the extracted DLLs/import libraries.
+`dist/` contains output artifacts only and is never searched for dependencies;
+clearing it does not trigger another runtime download. The runtime is downloaded
+only when its cached ZIP is absent, or replaced using `--runtime-zip`.
 `--package-zip` skips compilation and wraps a current, service-capable ZIP;
 `--runtime-zip` selects runtime DLLs during compilation; `--output` chooses the
 Setup EXE path. The normal portable ZIP is still produced. NSIS sources are in
@@ -319,7 +352,7 @@ lock/unlock and UAC transitions retain the existing DTLS sessions and input
 ownership. An inaccessible desktop causes an input gap, not a network restart.
 A console-session change or network-process failure still requires reconnecting.
 
-The per-session `Mousehop.Desktop.v2` named pipe admits SYSTEM only, rejects
+The per-session `Mousehop.Desktop.v3` named pipe admits SYSTEM only, rejects
 remote clients, and verifies both endpoint identities. Each helper connection has
 a generation: stale capture, clipboard and completion messages are discarded.
 Capture-edge configuration is replayed to a new helper; input events are never
@@ -362,9 +395,9 @@ heartbeats or shutdown; check for `SendInput recovered` if that worker remains
 on the active desktop. Perform these checks on Windows; cross-compilation alone
 does not exercise Winlogon input or key cleanup.
 
-Settings explicitly starts a stopped SCM service and waits up to 30 seconds for
+The background entry point connects to the SCM service and waits up to 30 seconds for
 its running status, then up to 30 seconds for the worker IPC endpoint. Failure is
-shown in a native dialog. Both Settings and workers default to the machine
+shown in a native dialog. The entry point and workers default to the machine
 `config.toml` and `identity.pem`; portable profiles are not imported automatically.
 The Windows GUI uses named mutexes/events scoped to the user/session and installed
 or portable mode, avoiding TCP-port conflicts and stale connections after killing
@@ -373,24 +406,45 @@ operations; a pending read must not serialize outgoing configuration requests.
 GTK rejects requests with a toast while reconnecting, and allows 60 seconds for
 Windows worker recovery. Worker exit codes and desktop transitions are logged;
 all installed roles install a panic hook before service dispatch and write
-`%ProgramData%\Mousehop\panic.log`. Standard users can open the shared directory
+`%ProgramData%\Mousehop\panic-YYYY-MM-DD-PID.log`. Standard users can open the shared directory
 and read both logs/configuration in Explorer, but cannot modify shared state.
 The installer protects an existing `identity.pem` with an explicit protected
 SYSTEM/Administrators DACL before adding inherited Users read/execute rights to
 the directory. A new identity is created with that private DACL before writing
 key bytes, so it never inherits public read access. Service binaries remain
-administrator-writable only, and Settings/IPC still requires administrator consent.
+administrator-writable only, and machine configuration changes still require administrator consent.
 
 Installed binaries carry a `service-mode` marker in the protected installation
-directory. The GUI elevates with normal UAC consent and connects to the service
-without spawning or owning a daemon. CLI commands against the installed binary
-must be run from an elevated terminal. Windows local IPC now uses named pipes
-instead of `127.0.0.1:5252`: the service endpoint allows only SYSTEM and elevated
-Administrators, while portable endpoints are isolated by user SID. Remote pipe
-clients are rejected. Clients prohibit token impersonation and verify the server
-account before sending requests. Old Windows frontend binaries using the TCP
-endpoint cannot control this version; update frontend and daemon together. The
-network protocol serialization is unchanged by this service integration.
+directory. The non-elevated background Agent owns the native tray and file-paste
+bridge, while `mousehop-ui` owns only preferences/progress windows. Starting the
+Agent attaches to the service without spawning a second network Core. Settings
+reads shared state without elevation; a machine mutation uses a short-lived
+`mousehop.exe admin-request <hex-json>` process launched with UAC consent. The
+helper accepts only typed administrator operations and saves the result. Normal
+Agent/Settings processes never receive private-key material.
+
+The numeric release-pixel threshold is a desktop runtime preference, like
+pause/resume, and uses the existing user IPC connection without UAC. Core applies
+and persists it; no direct user write access to machine configuration is granted.
+Settings tracks outstanding threshold values in send order on every platform, so
+an older Sync/echo cannot move the slider away from the user's newest edit. A
+failed send or IPC reconnect clears that pending state and accepts Core's next
+canonical value. Zero continues to disable the wall-press release fallback.
+
+Windows local IPC uses `Mousehop.Service.v2` named pipes rather than TCP. Interactive
+clients must match the active physical-console session and its account. Each
+connection is classified by its real token; only SYSTEM/elevated administrators
+can send machine configuration commands. Remote pipe clients are rejected and
+clients verify the server identity before sending a version handshake. Portable
+endpoints remain isolated by user SID. Unix IPC sockets are mode 0600. All local
+frontends must negotiate IPC v4 before commands are accepted; old frontends must
+be updated with the runtime. Remote protocol serialization is unchanged.
+
+Pausing releases capture and all emulated handles, invalidates file offers and
+cancels transfers. In-flight clipboard receive tasks carry an epoch so they cannot
+publish after a pause. Quitting an installed app keeps Core's control endpoint
+alive but sharing idle; a protected volatile registry value retains intentional
+pause/stop across service crashes and is discarded by Windows at reboot.
 
 The installer fixes the binary location under Program Files, quotes the SCM
 image path, creates protected ProgramData state, rejects reparse points and
@@ -417,13 +471,13 @@ Windows runtime acceptance (requires a Windows 10/11 x64 machine and a paired pe
 1. Install from a standard account using administrator consent. Confirm files in
    Program Files, service account LocalSystem, automatic startup, and private-LAN
    firewall rules. Confirm standard users cannot modify executable/DLLs or read
-   ProgramData credentials, and cannot open the service named pipe. Opening
-   Settings must request elevation; portable instances must still work without it.
+   ProgramData credentials. Unprivileged pipe clients must be unable to change machine configuration.
+   Settings must open without elevation; pairing/configuration changes must request UAC. Portable instances must work without elevation.
    Confirm standard users can list `ProgramData\Mousehop` and read `config.toml`,
-   `service.log` and `panic.log` without elevation, but cannot modify those files.
+   `service-*.log`, `session-*.log`, `worker-*.log` and `panic-*.log` without elevation, but cannot modify those files.
    Repeat on an upgrade with existing configuration/key files and confirm that
    `identity.pem` remains unreadable and its contents/pairing are preserved.
-2. Pair a peer from elevated Settings, save configuration, close Settings, and
+2. Pair a peer from Settings with UAC consent for the authorization change, save configuration, close Settings, and
    confirm sharing continues. Reboot without logging in and control the console
    login screen using that peer. Windows Hello/credential-provider restrictions
    remain those of Windows. If policy requires Ctrl+Alt+Del, send the secure
@@ -450,7 +504,7 @@ Windows runtime acceptance (requires a Windows 10/11 x64 machine and a paired pe
 8. Pair two builds supporting explicit file paste. Copy a Chinese-named CSV
    and a folder containing files and an empty directory in Explorer/Finder.
    Confirm copying alone sends no file-content bytes even after 15 seconds.
-   Keep the receiving Mousehop settings hidden. In its Finder/Explorer open a
+   Keep the receiving Settings process closed. In its Finder/Explorer open a
    writable folder and use the normal paste shortcut, the Edit menu, and the
    context menu. Confirm that each triggers Mousehop automatically, without a
    Mousehop button/folder picker, and verify its independent progress window,
@@ -478,3 +532,164 @@ with `cargo test -p mousehop-ipc`; a macOS run cannot exercise Windows APIs.
 `cargo test -p mousehop-installer` covers full-path process selection and network
 byte order on all hosts. On Windows it also tests actual TCP/UDP listener ownership
 and current-process image-path queries without modifying services or firewall rules.
+
+## Runtime / UI separation validation
+
+The workspace is split into `mousehop-core` (shared library), `mousehop` (native
+Agent/runtime), `mousehop-gtk` (`mousehop-ui` settings/transfer executable), and
+`mousehop-cli`. Settings never owns the Core, native tray, or NativePasteBridge.
+The Agent attaches once per user/session and installation mode, invalidates old
+native offers on attachment/disconnection, and sends heartbeats. File pastes are
+bound to the transfer ID and clipboard generation. An Agent loss invalidates file
+transfers; an Agent-owned Core exits after heartbeat loss, while installed input
+sharing can continue independently of the user's desktop UI.
+
+Both Windows packages ship the same three executables. The installer starts the
+Agent at login and upgrades/uninstalls only matching full paths, including UI/CLI.
+macOS ships the helpers within the existing app bundle; dependency copying and
+inside-out signing include all executables.
+Each macOS executable, including `mousehop-ui`, carries its own
+`@executable_path/../Frameworks` run path. Packaging executes every bundled
+executable with `--version` after signing to catch dyld dependency failures;
+checking only the background executable does not validate its UI helper.
+On a graphical macOS/Windows host, `mousehop-ui --check-template` additionally
+initializes GTK and constructs the preferences template without connecting to
+Core, registering peers, or starting input capture/emulation.
+Windows capture publishes its thread ID only after creating the Win32 message
+queue. Updates to an exited thread return a capture error; shutdown tolerates a
+missing queue and joins the thread without panicking. The lifecycle regression
+tests use message queues without installing input hooks; run them on Windows
+with `cargo test -p mousehop-input-capture lifecycle_tests`.
+Per-user login startup uses a Run
+entry on portable Windows and a RunAtLoad LaunchAgent on macOS, without KeepAlive.
+macOS TCC revocation watching is owned solely by Core and runs independently of
+GTK. An initially unauthorized session starts no probe worker. Authorized sessions
+observe TCC database/WAL changes, with a 30-second fallback; probe subprocesses have
+a three-second deadline and abnormal exits never count as revoked permission.
+Confirmed revocation pauses sharing once, ends capture and opens Settings instead
+of exiting Agent/Core. Further permission edits do not recreate backends or spawn
+more probes in that session. After granting permissions, use Settings to restart
+the complete app. Late DTLS events after receiver shutdown end their read loop
+without panicking. Verify helper signing and the actual
+TCC attribution on macOS; do not assume an existing grant survives a changed signature.
+
+After implementation, run unit tests for the workspace, formatting, Clippy for
+all targets/features, and a Windows-target build. Runtime acceptance requires:
+
+1. Start paired Windows installed/portable and macOS apps with no Settings process;
+   use mouse/keyboard, text/images, and Explorer/Finder native file paste.
+2. Open/close and forcibly terminate Settings during a transfer. Transfer continues;
+   explicitly closing/cancelling the separate progress window cancels it.
+3. Pause while holding keys; confirm peer/local key release. Resume, then Quit and
+   confirm sharing stays stopped. Restart an installed service within the same boot;
+   it must retain pause/stop. Relaunch Mousehop to resume.
+4. Repeat Windows login/lock/UAC desktop transitions. Keep network sessions alive,
+   reject clipboard/file paste on secure desktops and during helper replacement.
+5. Run Settings as a standard console user: viewing needs no UAC; modifying machine
+   pairing/configuration does. Reject other accounts/sessions and non-elevated raw
+   machine commands. Preserve desktop-user filesystem permissions for paste.
+6. Verify repeated launches reuse Agent/Settings, Explorer restart restores the tray,
+   login startup runs without duplicate agents, and upgrade/removal handles UI/CLI.
+7. Revoke/grant macOS Accessibility, check safe tap teardown and backend recreation;
+   confirm clipboard privacy lists use application metadata supplied by the Agent.
+
+macOS permission restart is owned by the background Agent: Settings requests a
+restart over local IPC, then the Agent stops Core and all owned GUI helpers,
+releases its single-instance lock, and launches a fresh Agent with Settings open.
+Quit flushes the terminal runtime state to connected frontends before Core exits;
+the Agent also reaps its GUI children, with forced cleanup after a three-second
+grace period. Closing Settings alone continues to leave sharing running.
+
+On Windows, tray Quit closes Settings and transfer windows in both installed and
+portable mode. The installed service remains resident with sharing stopped, but
+its terminal state is broadcast before another IPC request is handled. The Agent
+reaps its UI helpers and terminates unresponsive helpers after the grace period.
+
+Windows Settings connection failures: pipe error 231 is a busy endpoint, not an
+absent runtime. Busy/denied endpoints never bootstrap another Agent or Core.
+Service pipe identity is verified using its explicitly SYSTEM-owned security
+descriptor, so a desktop user does not need access to the SYSTEM process token.
+Desktop clients receive data/read-control rights without permission to create
+additional service pipe instances. Both synchronous and asynchronous clients use
+the same access mask and identity validation.
+
+Windows installers embed a SHA-256 manifest of all shipped executables and DLLs.
+After stopping old processes and copying files, the native Install action verifies
+every installed payload hash before registering/starting the service. A partial
+or mixed-version upgrade fails with the affected filename in installation details.
+
+The Windows internal desktop pipe also uses an explicit SYSTEM owner, through
+`SecurityDescriptor::system_only()`. Inheriting the SYSTEM token's default owner
+can produce an Administrators-owned pipe and make the input helper reject it,
+causing repeated worker exits and unavailable input. Background helper processes
+use `STARTF_FORCEOFFFEEDBACK` to suppress launch feedback on the mouse cursor.
+The LocalSystem-only Windows regression test
+`desktop_worker_authenticates_the_actual_internal_pipe` exercises the actual
+internal pipe and its client identity check (run with `--ignored --exact` under
+LocalSystem on a Windows test machine).
+
+macOS application directories ending in `.app` with `Contents/Info.plist` are
+archived as `<name>.app.zip` before a file offer is sent. The native `ditto` ZIP
+writer preserves bundle symbolic links, executable bits and resource metadata;
+receivers save the ZIP as an opaque file and do not extract it automatically.
+Ordinary files/directories retain their existing transfer representation. Archive
+preflight uses the file-transfer size/entry limits, and temporary archives remain
+leased until all outgoing streams finish or are cancelled. Clipboard preparation
+runs outside the Core event loop so input and desktop Agent heartbeats continue
+during compression. A newer copy, pause or shutdown cancels preparation and its
+archive subprocess. Preparation failures appear in a separate transfer window.
+Completed transfer windows close immediately; failed transfers remain visible.
+
+Mac Agent/Core runtime logs are saved to `~/Library/Logs/Mousehop/agent-YYYY-MM-DD-PID.log` and
+`core-YYYY-MM-DD-PID.log`, including when Finder/Launch Services directs stderr to `/dev/null`.
+
+macOS startup opens Settings whenever Accessibility or Input Monitoring permission
+is missing, including when a pre-existing configuration makes the installation
+appear already configured. Permission checks use non-prompting preflight APIs.
+
+Local IPC v4 adds `FilePasteConflict`, `ResolveFilePasteConflict`, and the
+`WaitingForConflict` transfer phase. The Core owns staged files and destination
+publication. The transfer GUI displays Replace/Rename/Cancel and a prefilled rename
+field; replies must match both the active transfer ID and outstanding question ID.
+Pending questions are replayed on Sync. A renamed item that also exists prompts
+again. Cancel, close, new clipboard contents and shutdown cancel the paste and
+restore prior items. Rollback never overwrites a concurrently created file; if
+restoration is blocked, the originals remain in the reported backup directory.
+
+Desktop Agent heartbeats run on a dedicated thread after IPC negotiation, using
+a mutex shared with command writes on the same connection. Native menu tracking
+therefore cannot stop the one-second heartbeat or trigger the five-second Core
+watchdog. Heartbeat expiry and explicit IPC Quit are logged separately. Late DTLS
+events received after capture shutdown end the network reader without panicking.
+On Unix, `ConnectionRefused` is treated as an absent endpoint: a stale socket left
+by a crashed Core can be reclaimed by the listener and the Agent can start Core
+again. Permission-denied and busy endpoints remain non-bootstrap errors.
+
+Translation catalogs use `key<TAB>value` entries and may contain blank separator
+lines. Template generation and runtime lookup share the same parser; malformed
+nonblank entries report their original line number during the build.
+
+`mousehop-logging` owns the common Mac/Windows retention policy. File logging is
+on at INFO by default, including GUI/transfer processes. Each process writes a
+role/date/PID file, rotating at UTC midnight on its next write. One maintenance
+thread per process/directory runs immediately and every 60 seconds, deleting only
+recognized Mousehop files outside the seven retained UTC dates (today plus six).
+Legacy fixed-name logs are compacted using each record's timestamp, with panic
+backtraces retained as a unit. Recent/in-use legacy logs are deferred, file locks
+prevent competing cleanup, snapshots are rechecked, and filtered content is
+published atomically. Unchanged legacy files are cached until their contents or
+retention cutoff changes. Cleanup never follows log-named symlinks and does not
+remove configuration, certificates, unknown logs or unrelated files.
+
+Windows return-edge detection observes Mousehop-tagged relative pointer injection
+without forwarding those injected events again. Reaching the last contained
+pixel while moving outward triggers the real exposed edge; monitor seams and
+absolute landing warps do not. The SYSTEM desktop pipe v3 carries Begin cursor
+coordinates and normalized fractions through to the network process, matching
+portable Windows. Returning is therefore driven by receiver cursor position,
+while release px remains a fallback for missing peer-side capture. Handover and
+fallback landing points sit eight coordinate units inside the destination
+contour (less on tiny outputs), preserving the cross axis and avoiding an
+immediate bounce on a small reverse motion. Sender cursor modeling uses the same
+inset for confirmed peer topology. Upgrade the complete Windows package so the
+session process and desktop helper both use pipe v3.

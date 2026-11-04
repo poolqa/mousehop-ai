@@ -5,10 +5,12 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
@@ -18,10 +20,76 @@ use tokio::net::UnixStream;
 
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeServer as PipeListener;
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::NamedPipeServer as PipeStream;
 
 use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
+
+type RequestStream = Pin<Box<dyn Stream<Item = (bool, Result<FrontendRequest, IpcError>)> + Send>>;
+
+const FRONTEND_QUEUE_CAPACITY: usize = 128;
+
+struct OutgoingFrame {
+    bytes: Arc<[u8]>,
+    written: Option<oneshot::Sender<()>>,
+}
+
+struct FrontendWriter {
+    frames: mpsc::Sender<OutgoingFrame>,
+    task: tokio::task::JoinHandle<()>,
+    close_reader: Option<oneshot::Sender<()>>,
+}
+
+impl FrontendWriter {
+    fn new(writer: impl AsyncWrite + Unpin + Send + 'static) -> (Self, oneshot::Receiver<()>) {
+        let (frames, mut incoming) = mpsc::channel::<OutgoingFrame>(FRONTEND_QUEUE_CAPACITY);
+        let (close_reader, closed) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some(frame) = incoming.recv().await {
+                if writer.write_all(&frame.bytes).await.is_err() {
+                    break;
+                }
+                if let Some(written) = frame.written {
+                    let _ = written.send(());
+                }
+            }
+        });
+        (
+            Self {
+                frames,
+                task,
+                close_reader: Some(close_reader),
+            },
+            closed,
+        )
+    }
+}
+
+impl Drop for FrontendWriter {
+    fn drop(&mut self) {
+        // Close both pipe directions, including a writer blocked by a native
+        // menu's stalled client. A partially written frame is never reused.
+        self.task.abort();
+        self.close_reader.take();
+    }
+}
+
+fn broadcast_frame(writers: &mut Vec<FrontendWriter>, frame: Arc<[u8]>) {
+    writers.retain(|writer| {
+        if writer
+            .frames
+            .try_send(OutgoingFrame {
+                bytes: frame.clone(),
+                written: None,
+            })
+            .is_ok()
+        {
+            true
+        } else {
+            log::warn!("Disconnecting stalled or closed frontend; Core input remains responsive");
+            false
+        }
+    });
+}
 
 pub struct AsyncFrontendListener {
     #[cfg(windows)]
@@ -30,14 +98,8 @@ pub struct AsyncFrontendListener {
     listener: UnixListener,
     #[cfg(unix)]
     socket_path: PathBuf,
-    #[cfg(unix)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
-    #[cfg(windows)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<PipeStream>>>>,
-    #[cfg(unix)]
-    tx_streams: Vec<WriteHalf<UnixStream>>,
-    #[cfg(windows)]
-    tx_streams: Vec<WriteHalf<PipeStream>>,
+    line_streams: SelectAll<RequestStream>,
+    tx_streams: Vec<FrontendWriter>,
 }
 
 impl AsyncFrontendListener {
@@ -68,6 +130,9 @@ impl AsyncFrontendListener {
                 }
                 Err(e) => return Err(IpcListenerCreationError::Bind(e)),
             };
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(IpcListenerCreationError::Bind)?;
             (socket_path, listener)
         };
 
@@ -90,20 +155,34 @@ impl AsyncFrontendListener {
         let mut json = serde_json::to_string(&notify).unwrap();
         json.push('\n');
 
-        let mut keep = vec![];
-        // TODO do simultaneously
-        for tx in self.tx_streams.iter_mut() {
-            // write len + payload
-            if tx.write_all(json.as_bytes()).await.is_err() {
-                keep.push(false);
-                continue;
-            }
-            keep.push(true);
-        }
+        // A GUI or tray menu may stop draining its socket. Never await that
+        // client on Core's loop, which also handles desktop liveness/control.
+        broadcast_frame(&mut self.tx_streams, json.into_bytes().into());
+        // Give healthy writer tasks a turn during a large initial state sync.
+        tokio::task::yield_now().await;
+    }
 
-        // could not find a better solution because async
-        let mut keep = keep.into_iter();
-        self.tx_streams.retain(|_| keep.next().unwrap());
+    /// Deliver queued final state before shutdown, with a bounded total wait.
+    pub async fn flush(&mut self) {
+        let mut pending = Vec::new();
+        for writer in &self.tx_streams {
+            let (written, done) = oneshot::channel();
+            if writer
+                .frames
+                .try_send(OutgoingFrame {
+                    bytes: Arc::from([]),
+                    written: Some(written),
+                })
+                .is_ok()
+            {
+                pending.push(done);
+            }
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            futures::future::join_all(pending),
+        )
+        .await;
     }
 }
 
@@ -118,9 +197,15 @@ impl Drop for AsyncFrontendListener {
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(Ok(l))) = self.line_streams.poll_next_unpin(cx) {
-            let request = serde_json::from_str(l.as_str()).map_err(|e| e.into());
-            return Poll::Ready(Some(request));
+        while let Poll::Ready(Some((privileged, line))) = self.line_streams.poll_next_unpin(cx) {
+            let request = line;
+            match &request {
+                Ok(request) if !privileged && request.requires_admin() => {
+                    log::warn!("Rejected non-elevated machine configuration request");
+                    continue;
+                }
+                _ => return Poll::Ready(Some(request)),
+            }
         }
         let mut sync = false;
         loop {
@@ -148,19 +233,88 @@ impl Stream for AsyncFrontendListener {
                 };
                 std::mem::replace(&mut self.listener, next)
             };
+            #[cfg(windows)]
+            let privileged = if crate::windows::service_mode() {
+                match crate::windows::client_is_admin(&stream) {
+                    Ok(privileged) => privileged,
+                    Err(error) => {
+                        log::warn!("Rejected desktop IPC connection: {error}");
+                        continue;
+                    }
+                }
+            } else {
+                true
+            };
+            #[cfg(unix)]
+            let privileged = true;
             let (rx, tx) = tokio::io::split(stream);
+            let (writer, closed) = FrontendWriter::new(tx);
             let buf_reader = BufReader::new(rx);
             let lines = buf_reader.lines();
             let lines = LinesStream::new(lines);
-            self.line_streams.push(lines);
-            self.tx_streams.push(tx);
+            let mut negotiated = false;
+            self.line_streams.push(
+                lines
+                    .take_until(async move {
+                        let _ = closed.await;
+                    })
+                    .map(move |line| {
+                        let request = line
+                            .map_err(IpcError::from)
+                            .and_then(|line| decode_request(&line, &mut negotiated));
+                        (privileged, request)
+                    })
+                    .boxed(),
+            );
+            self.tx_streams.push(writer);
             sync = true;
         }
         if sync {
-            Poll::Ready(Some(Ok(FrontendRequest::Sync)))
-        } else {
-            Poll::Pending
+            cx.waker().wake_by_ref();
         }
+        Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn stalled_menu_client_cannot_block_another_client_or_broadcast() {
+        let (slow, _not_reading) = tokio::io::duplex(16);
+        let (fast, mut reading) = tokio::io::duplex(4096);
+        let (slow, slow_closed) = FrontendWriter::new(slow);
+        let (fast, mut fast_closed) = FrontendWriter::new(fast);
+        let mut writers = vec![slow, fast];
+        let frame: Arc<[u8]> = vec![b'x'; 128].into();
+        // Simulate a menu suspending its Agent while the other frontend drains.
+        for _ in 0..FRONTEND_QUEUE_CAPACITY + 2 {
+            broadcast_frame(&mut writers, frame.clone());
+            let mut received = [0; 128];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                reading.read_exact(&mut received),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(received, *frame);
+        }
+        assert_eq!(writers.len(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), slow_closed)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(
+            fast_closed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(writers);
+        assert!(fast_closed.await.is_err());
     }
 }
 
@@ -228,5 +382,66 @@ mod windows_tests {
         assert!(
             matches!(reading.join().unwrap(), Some(Ok(FrontendEvent::Error(value))) if value == "concurrent read/write")
         );
+    }
+}
+
+fn decode_request(line: &str, negotiated: &mut bool) -> Result<FrontendRequest, IpcError> {
+    if line.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC command exceeds limit",
+        )
+        .into());
+    }
+    let request: FrontendRequest = serde_json::from_str(line)?;
+    if let FrontendRequest::Hello { version } = request {
+        *negotiated = version == crate::LOCAL_PROTOCOL_VERSION;
+        if !*negotiated {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Incompatible Mousehop IPC version",
+            )
+            .into());
+        }
+        return Ok(FrontendRequest::Sync);
+    }
+    if !*negotiated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "IPC version handshake required",
+        )
+        .into());
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    #[test]
+    fn old_or_unnegotiated_frontends_cannot_mutate_runtime() {
+        let mut negotiated = false;
+        assert!(decode_request("\"Create\"", &mut negotiated).is_err());
+        let old = serde_json::to_string(&FrontendRequest::Hello {
+            version: crate::LOCAL_PROTOCOL_VERSION - 1,
+        })
+        .unwrap();
+        assert!(decode_request(&old, &mut negotiated).is_err());
+        assert!(decode_request("{\"SetSharing\":true}", &mut negotiated).is_err());
+        let current = serde_json::to_string(&FrontendRequest::Hello {
+            version: crate::LOCAL_PROTOCOL_VERSION,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_request(&current, &mut negotiated),
+            Ok(FrontendRequest::Sync)
+        ));
+        assert!(matches!(
+            decode_request("{\"SetSharing\":false}", &mut negotiated),
+            Ok(FrontendRequest::SetSharing(false))
+        ));
+        // A failed renegotiation must revoke a previously successful handshake.
+        assert!(decode_request(&old, &mut negotiated).is_err());
+        assert!(decode_request("\"Quit\"", &mut negotiated).is_err());
     }
 }

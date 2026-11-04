@@ -7,6 +7,8 @@ members = [
     "input-emulation",
     "input-event",
     "mousehop",
+    "mousehop-core",
+    "mousehop-logging",
     "mousehop-ipc",
     "mousehop-installer",
     "mousehop-cli",
@@ -18,9 +20,11 @@ members = [
 version = "0.18.0"
 
 [workspace.dependencies]
-input-event = { package = "mousehop-input-event", path = "input-event", version = "0.18.0" }
-input-capture = { package = "mousehop-input-capture", path = "input-capture", version = "0.18.0" }
-input-emulation = { package = "mousehop-input-emulation", path = "input-emulation", version = "0.18.0" }
+mousehop-logging = { path = "mousehop-logging", version = "0.18.0" }
+mousehop-core = { path = "mousehop-core", version = "0.18.0", default-features = false }
+input-event = { package = "mousehop-input-event", path = "input-event", version = "0.18.0", default-features = false }
+input-capture = { package = "mousehop-input-capture", path = "input-capture", version = "0.18.0", default-features = false }
+input-emulation = { package = "mousehop-input-emulation", path = "input-emulation", version = "0.18.0", default-features = false }
 mousehop-proto = { path = "mousehop-proto", version = "0.18.0" }
 mousehop-ipc = { path = "mousehop-ipc", version = "0.18.0" }
 mousehop-cli = { path = "mousehop-cli", version = "0.18.0" }

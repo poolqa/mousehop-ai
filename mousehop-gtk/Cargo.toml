@@ -7,6 +7,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/jondkinney/mousehop"
 
 [dependencies]
+mousehop-logging = { workspace = true }
 gtk = { package = "gtk4", version = "0.9.0", features = ["v4_6"] }
 adw = { package = "libadwaita", version = "0.7.0", features = ["v1_1"] }
 async-channel = { version = "2.1.1" }
@@ -14,11 +15,7 @@ hostname = "0.4.0"
 log = "0.4.20"
 mousehop-ipc = { workspace = true }
 input-event = { workspace = true, default-features = false }
-input-capture = { workspace = true, default-features = false }
 thiserror = "2.0.0"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-ksni = "0.2"
 
 # Notification-area icon (see src/windows_tray.rs). Same major version
 # as the Windows capture / emulation backends so the feature sets
@@ -35,5 +32,18 @@ windows = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dependencies.env_logger]
+version = "0.11.3"
+
+[dependencies.shadow-rs]
+version = "1.2.0"
+features = ["metadata"]
+
 [build-dependencies]
+embed-resource = "3.0"
+shadow-rs = "1.2.0"
 glib-build-tools = { version = "0.20.0" }
+
+[[bin]]
+name = "mousehop-ui"
+path = "src/main.rs"

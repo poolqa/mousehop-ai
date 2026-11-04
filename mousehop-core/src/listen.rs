@@ -510,13 +510,16 @@ fn spawn_accept_task(
                         let certs = dtls_conn.connection_state().await.peer_certificates;
                         let cert = certs.first().expect("cert");
                         let fingerprint = crypto::generate_fingerprint(cert);
-                        listen_tx
+                        if listen_tx
                             .send(ListenEvent::Accept {
                                 addr,
                                 session,
                                 fingerprint,
                             })
-                            .expect("channel closed");
+                            .is_err() {
+                            let _ = conn.close().await;
+                            break;
+                        }
                         spawn_local(read_loop(
                             conns.clone(),
                             sessions.clone(),
@@ -534,9 +537,9 @@ fn spawn_accept_task(
                                         if let Some(fingerprint) =
                                             connection_attempts.lock().expect("lock").pop_front()
                                         {
-                                            listen_tx
+                                            if listen_tx
                                                 .send(ListenEvent::Rejected { fingerprint })
-                                                .expect("channel closed");
+                                                .is_err() { break; }
                                         }
                                     }
                                     _ => log::warn!("accept: {de}"),
@@ -831,7 +834,7 @@ async fn read_loop(
                     break;
                 }
                 hello_ok.set(true);
-                dtls_tx
+                if dtls_tx
                     .send(ListenEvent::Msg {
                         event: ProtoEvent::Hello {
                             magic,
@@ -841,15 +844,23 @@ async fn read_loop(
                         addr,
                         session,
                     })
-                    .expect("channel closed");
+                    .is_err()
+                {
+                    break;
+                }
             }
-            Some(event) => dtls_tx
-                .send(ListenEvent::Msg {
-                    event,
-                    addr,
-                    session,
-                })
-                .expect("channel closed"),
+            Some(event) => {
+                if dtls_tx
+                    .send(ListenEvent::Msg {
+                        event,
+                        addr,
+                        session,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             None => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full
@@ -949,6 +960,75 @@ fn decode_listen_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
 mod tests {
     use super::*;
     use tokio::net::UdpSocket;
+
+    async fn closed_receiver_ends_reader(close_before_hello: bool) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let addr = peer.local_addr().unwrap();
+                socket.connect(addr).await.unwrap();
+                peer.connect(socket.local_addr().unwrap()).await.unwrap();
+                let sessions = ListenerSessions::default();
+                let session = sessions.allocate(addr);
+                let conn: ArcConn = socket;
+                let conns = Rc::new(AsyncMutex::new(HashMap::from([(
+                    addr,
+                    AcceptedConnection {
+                        session,
+                        conn: conn.clone(),
+                    },
+                )])));
+                let (tx, rx) = channel();
+                let producer = async {
+                    let mut receiver = Some(rx);
+                    if close_before_hello {
+                        receiver.take();
+                    }
+                    let hello = ProtoEvent::Hello {
+                        magic: PROTOCOL_MAGIC,
+                        commit: [0; 8],
+                        capabilities: 0,
+                    };
+                    let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = hello.into();
+                    peer.send(&bytes[..len]).await.unwrap();
+                    if !close_before_hello {
+                        assert!(matches!(
+                            receiver.as_mut().unwrap().recv().await,
+                            Some(ListenEvent::Msg {
+                                event: ProtoEvent::Hello { .. },
+                                ..
+                            })
+                        ));
+                        receiver.take();
+                        let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
+                        peer.send(&bytes[..len]).await.unwrap();
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    let (result, ()) = tokio::join!(
+                        read_loop(conns.clone(), sessions.clone(), addr, session, conn, tx),
+                        producer
+                    );
+                    result.unwrap();
+                })
+                .await
+                .unwrap();
+                assert!(conns.lock().await.is_empty());
+                assert!(!sessions.is_current(addr, session));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn receiver_closed_before_hello_does_not_panic() {
+        closed_receiver_ends_reader(true).await;
+    }
+
+    #[tokio::test]
+    async fn late_packet_after_receiver_shutdown_does_not_panic() {
+        closed_receiver_ends_reader(false).await;
+    }
 
     async fn test_conn() -> ArcConn {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))

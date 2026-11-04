@@ -98,8 +98,9 @@ It can be used as a remote control for any device supported by Mousehop.
 - Download the `.dmg` for your Mac (Intel or Apple Silicon) from the releases page
 - Open the `.dmg` and drag `Mousehop.app` into `Applications`
 - Launch the app — release builds are signed with a Developer ID and notarized by Apple, so it opens with no Gatekeeper prompt
-- Use the menu bar item to open the settings window or quit Mousehop. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
+- Use the menu bar item to open the settings window or quit Mousehop. Bundled macOS builds run as a menu bar app; the background Agent, Settings and transfer windows do not add a Dock icon.
 - Grant accessibility permissions in System Settings
+- After granting macOS input permissions, restart Mousehop from Settings. Removing permissions pauses sharing and keeps Settings available; it does not close the app or repeatedly recreate input backends.
 - While this Mac is controlling a peer, Mousehop automatically keeps macOS from starting the idle screen saver or turning off the display. The keep-awake assertion ends as soon as the cursor returns to this Mac.
 - If the Mac nevertheless locks after a controlled peer sleeps or disconnects, Mousehop releases capture and shows confirmed recovery status on that peer. Use the keyboard physically attached to the Mac: Shift is a harmless wake key, then wait for the status; type the Mac password only while the peer still reports **locked**. The dialog has no password field, and Mousehop never reads or transports the password. If status becomes **unavailable**, switch the monitor to the Mac or use Touch ID, Apple Watch, or your hardware input switch instead.
 
@@ -138,14 +139,14 @@ installed Settings processes during upgrades/removal, so save pending changes
 first. Same-named portable instances do not block installation; a portable daemon
 using the service port is identified by PID/path and can be stopped with consent.
 The service startup log is
-`%ProgramData%\Mousehop\service.log`.
+`%ProgramData%\Mousehop\service-YYYY-MM-DD-PID.log`.
 
 Installed Settings uses the same machine configuration and identity as the service.
 Opening Settings starts a stopped service; IPC reconnects after worker replacement.
 Windows pipe reads and writes use separate overlapped operations so adding an
 Outgoing client cannot block behind the background reader. Startup failures show
 a dialog, and installed-process panics are recorded in
-`%ProgramData%\Mousehop\panic.log`. Standard users can open the shared directory
+`%ProgramData%\Mousehop\panic-YYYY-MM-DD-PID.log`. Standard users can open the shared directory
 and read configuration and logs in Explorer. They cannot modify shared state;
 the private key in `identity.pem` remains readable only by SYSTEM and elevated
 administrators. Settings still requires UAC to change pairing/configuration.
@@ -199,7 +200,7 @@ terminal anyway. As with any Windows GUI program, the prompt returns immediately
 rather than waiting for the command to finish.
 
 Crashes are recorded either way, at
-`%LOCALAPPDATA%\Mousehop\logs\panic.log`.
+`%LOCALAPPDATA%\Mousehop\logs\panic-YYYY-MM-DD-PID.log`.
 
 </details>
 
@@ -636,13 +637,10 @@ Defaults are `false`. Text and image sync retain their existing behavior.
   clipboard) invalidates the pending file offer. Pasting locally without a new
   copy does not invalidate it. One offer permits one paste; copy again to retry
   or paste into another folder. Existing destination names are never overwritten.
-- Automatic file paste currently integrates Windows Explorer and macOS Finder
-  (English and Chinese regular Paste menus). Rename/search/text fields and
-  special paste commands are excluded. Mousehop must be running in the tray/
-  menu bar. On installed Windows, the service alone cannot detect incoming
-  native file pastes or display progress: launch Mousehop Settings once, then
-  close its window to leave the GUI running in the system tray. Choosing Quit
-  stops that GUI even though the Windows service continues running.
+- Automatic file paste integrates Windows Explorer and macOS Finder
+  (English and Chinese regular Paste menus). The background desktop Agent owns
+  native paste detection; Settings does not need to be opened or kept running.
+  Both Windows installation modes and macOS start the same background flow.
   macOS requires Accessibility and Input Monitoring permissions;
   Finder automation may also request permission to determine its insertion
   folder. No macFUSE or system extension is required. A destination that cannot
@@ -742,3 +740,58 @@ The following sections detail the emulation and capture backends provided by mou
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.
 - `x11`: TODO (not yet supported)
+
+### Background application and separate UI
+
+`mousehop` is the background entry point. It owns the native notification-area /
+menu-bar icon, supervises a portable/user Core, and opens `mousehop-ui` only for
+Settings or a transfer progress window. Installed Windows uses SCM to supervise
+the same Core and keeps its existing login/lock/UAC desktop workers. Close
+Settings to end that UI process without interrupting input, clipboard sync or
+file transfers. **Quit Mousehop** stops sharing, cancels transfers and releases
+keys; an installed Windows service stays idle until a new launch or reboot.
+An intentional pause/quit survives service recovery during the same Windows boot.
+
+The `mousehop-core` crate contains the shared runtime logic and has no GTK or CLI
+dependency. `mousehop-gtk` is an IPC client and has no input backend dependency.
+Build the runtime independently with `cargo build -p mousehop`; build a complete
+application with `cargo build -p mousehop -p mousehop-gtk -p mousehop-cli`.
+Keep all three executables together (inside one `.app` on macOS). The legacy
+`gtk` runtime feature is accepted for packaging compatibility and links no GTK.
+
+- `mousehop agent`: start in the background (open Settings on an unpaired first run).
+- `mousehop settings`: start/attach to the background application and open Settings.
+- `mousehop daemon`: run Core directly without tray or Settings; native file paste
+  needs a desktop Agent, while input and ordinary clipboard backends remain usable.
+- `mousehop-cli pause|resume|quit|settings`: control the same runtime over IPC.
+- **Start at login** in Settings controls per-user startup for portable Windows
+  and macOS. Installed Windows login startup is managed by the installer.
+
+Opening installed Windows Settings requires no UAC. Machine configuration and
+pairing changes launch a short-lived elevated helper after normal UAC consent;
+the Agent remains non-elevated. The service authenticates the active console
+account/session and rejects unprivileged configuration commands. File access
+continues to use the desktop user's permissions. Local IPC v4 requires a version
+handshake; update runtime, UI and CLI together. The remote peer protocol is unchanged.
+
+On macOS, copied application bundles (`.app`) are sent as `.app.zip` archives
+to preserve their symbolic links and permissions. Regular files and folders are
+sent directly. Transfer windows close immediately on success and remain open on
+failure. Mac runtime logs are available in `~/Library/Logs/Mousehop/`.
+
+On macOS, launching Mousehop with missing Accessibility or Input Monitoring
+permissions opens Settings automatically. On both Windows and macOS, pasting
+files with existing destination names offers Replace, Rename, or Cancel. Rename
+keeps both items; Replace replaces the complete item (including a whole folder).
+Cancelling or failing rolls back prior replacements.
+
+Mac and Windows enable INFO-level file logging by default for the background
+Agent, Core/service, Settings and transfer windows. Logs rotate by UTC date and
+process ID; automatic cleanup keeps today and the preceding six UTC dates.
+Cleanup runs at startup and every minute while Mousehop is running. Old single
+`.log` files are filtered by record date once idle; multiline panic records stay
+together. `MOUSEHOP_LOG_LEVEL` can override the default level.
+
+Mac logs: `~/Library/Logs/Mousehop/`. Windows user logs:
+`%LOCALAPPDATA%\Mousehop\logs\`. Windows service/session/worker logs:
+`%ProgramData%\Mousehop\`. The shared logging crate requires Rust 1.89 or newer.

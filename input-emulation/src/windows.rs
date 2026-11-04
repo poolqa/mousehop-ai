@@ -76,6 +76,7 @@ fn read_spi_u32(action: SYSTEM_PARAMETERS_INFO_ACTION) -> Option<u32> {
 }
 
 pub(crate) struct WindowsEmulation {
+    modifiers: crate::windows_modifiers::ModifierRecovery,
     repeat_task: Option<AbortHandle>,
     /// Cached virtual-screen origin, refreshed on each
     /// `display_bounds()` call — which the emulation proxy invokes
@@ -91,6 +92,7 @@ pub(crate) struct WindowsEmulation {
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
         Ok(Self {
+            modifiers: Default::default(),
             repeat_task: None,
             virtual_screen_origin: Cell::new(None),
             remote: mousehop_ipc::desktop::current(),
@@ -107,10 +109,21 @@ impl Emulation for WindowsEmulation {
     ) -> Result<(), EmulationError> {
         if let Some(remote) = &self.remote {
             if let Some(input) = mousehop_ipc::desktop::Input::from_event(&event) {
-                remote.send(mousehop_ipc::desktop::Request::Input { handle, input });
+                remote
+                    .send(mousehop_ipc::desktop::Request::Input { handle, input })
+                    .await;
             }
             return Ok(());
         }
+        if let Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed, latched, ..
+        }) = &event
+        {
+            self.modifiers.snapshot(handle, depressed | latched);
+        }
+        // Repair only releases owed by our own injected input, never blanket
+        // Shift/Ctrl/Alt/Win resets that could break a real held shortcut.
+        self.modifiers.retry(|key| key_event(key, 0));
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
@@ -131,6 +144,7 @@ impl Emulation for WindowsEmulation {
                     state,
                 } => {
                     let submitted = key_event(key, state);
+                    self.modifiers.record(handle, key, state, submitted);
                     if !submitted || key == scancode::Linux::KeyCapsLock as u32 {
                         // Lock keys are discrete toggles. Never synthesize
                         // repeats: delayed release delivery must not flip the
@@ -147,7 +161,7 @@ impl Emulation for WindowsEmulation {
                         }
                     }
                 }
-                KeyboardEvent::Modifiers { .. } => {}
+                KeyboardEvent::Modifiers { .. } => {} // Reconciled before dispatch above.
             },
             Event::Clipboard(_) => {
                 // Clipboard injection is handled by the cross-
@@ -162,12 +176,18 @@ impl Emulation for WindowsEmulation {
 
     async fn destroy(&mut self, handle: EmulationHandle) {
         if let Some(remote) = &self.remote {
-            remote.send(mousehop_ipc::desktop::Request::Destroy(handle));
+            remote
+                .send(mousehop_ipc::desktop::Request::Destroy(handle))
+                .await;
         }
+        self.modifiers.release(handle);
+        self.modifiers.retry(|key| key_event(key, 0));
         self.kill_repeat_task();
     }
 
     async fn terminate(&mut self) {
+        self.modifiers.release_all();
+        self.modifiers.retry(|key| key_event(key, 0));
         self.kill_repeat_task();
     }
 
@@ -222,7 +242,7 @@ impl Emulation for WindowsEmulation {
                 dwFlags: MOUSEEVENTF_MOVE
                     | windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_ABSOLUTE
                     | windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_VIRTUALDESK,
-                dwExtraInfo: input_event::WINDOWS_INPUT_EVENT_TAG,
+                dwExtraInfo: input_event::WINDOWS_POINTER_WARP_TAG,
                 ..Default::default()
             });
         }
@@ -387,17 +407,7 @@ fn scroll(axis: u8, value: i32) {
 }
 
 fn is_modifier_key(key: u32) -> bool {
-    matches!(
-        scancode::Linux::try_from(key),
-        Ok(scancode::Linux::KeyLeftShift
-            | scancode::Linux::KeyRightShift
-            | scancode::Linux::KeyLeftCtrl
-            | scancode::Linux::KeyRightCtrl
-            | scancode::Linux::KeyLeftAlt
-            | scancode::Linux::KeyRightalt
-            | scancode::Linux::KeyLeftMeta
-            | scancode::Linux::KeyRightmeta)
-    )
+    crate::modifiers::modifier_mask(key).is_some()
 }
 
 fn key_event(key: u32, state: u8) -> bool {

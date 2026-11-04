@@ -90,6 +90,8 @@ cd "$repo_root"
 echo "==> Generating macOS icons"
 "$script_dir/makeicns.sh"
 
+cargo build --release -p mousehop -p mousehop-gtk -p mousehop-cli
+
 echo "==> Creating Mousehop.app"
 # cargo-bundle resolves icon/resource globs from its current directory.
 (
@@ -97,6 +99,8 @@ echo "==> Creating Mousehop.app"
     cargo bundle --release
 )
 
+cp "$repo_root/target/release/mousehop-ui" "$app/Contents/MacOS/"
+cp "$repo_root/target/release/mousehop-cli" "$app/Contents/MacOS/"
 echo "==> Bundling Homebrew dylibs and resources"
 "$script_dir/copy-macos-dylib.sh" "$app/Contents/MacOS/mousehop"
 

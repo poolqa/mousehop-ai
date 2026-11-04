@@ -13,7 +13,7 @@ use tokio_stream::wrappers::LinesStream;
 use tokio::net::UnixStream;
 
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient as PipeStream};
+use tokio::net::windows::named_pipe::NamedPipeClient as PipeStream;
 
 pub struct AsyncFrontendEventReader {
     #[cfg(unix)]
@@ -47,8 +47,12 @@ impl Stream for AsyncFrontendEventReader {
 
 impl AsyncFrontendRequestWriter {
     pub async fn request(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
+        #[cfg(windows)]
+        if crate::windows::route_admin_request(&request)? {
+            return Ok(());
+        }
         let mut json = serde_json::to_string(&request).unwrap();
-        log::debug!("requesting: {json}");
+        log::trace!("sending frontend request");
         json.push('\n');
         self.tx.write_all(json.as_bytes()).await?;
         Ok(())
@@ -74,7 +78,13 @@ pub async fn connect_async(
     let lines = buf_reader.lines();
     let lines_stream = LinesStream::new(lines);
     let reader = AsyncFrontendEventReader { lines_stream };
-    let writer = AsyncFrontendRequestWriter { tx };
+    let mut writer = AsyncFrontendRequestWriter { tx };
+    writer
+        .request(FrontendRequest::Hello {
+            version: crate::LOCAL_PROTOCOL_VERSION,
+        })
+        .await
+        .map_err(std::io::Error::other)?;
     Ok((reader, writer))
 }
 
@@ -97,13 +107,11 @@ async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 async fn wait_for_service() -> Result<PipeStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        match ClientOptions::new()
-            .security_qos_flags(0x0001_0000)
-            .open(crate::windows::pipe_name()?)
-        {
-            Ok(stream) => {
-                crate::windows::verify_server(&stream)?;
-                break Ok(stream);
+        match crate::windows::open_client() {
+            Ok(file) => {
+                use std::os::windows::io::IntoRawHandle;
+                // Transfer the overlapped handle into Tokio's IOCP registration.
+                break Ok(unsafe { PipeStream::from_raw_handle(file.into_raw_handle()) }?);
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(e.into()),
             Err(_) => {}

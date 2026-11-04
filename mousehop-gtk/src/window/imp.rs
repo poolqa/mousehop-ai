@@ -19,6 +19,13 @@ use crate::lock_recovery_window::LockRecoveryWindow;
 #[template(resource = "/com/mousehop/Mousehop/window.ui")]
 pub struct Window {
     #[template_child]
+    pub sharing_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub autostart_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub runtime_state_row: TemplateChild<adw::ActionRow>,
+    pub runtime_update: std::cell::Cell<bool>,
+    #[template_child]
     pub file_paste_box: TemplateChild<gtk::Box>,
     pub(crate) file_paste_panel: RefCell<Option<crate::file_paste::FilePastePanel>>,
     #[template_child]
@@ -98,6 +105,7 @@ pub struct Window {
     /// value-changed signal, so we can block it when programmatically
     /// updating the slider in response to a Sync event.
     pub release_threshold_handler: RefCell<Option<glib::SignalHandlerId>>,
+    pub(crate) release_threshold_edit: RefCell<crate::release_threshold::ThresholdEdit>,
     /// Same pattern for the mDNS-discovery switch.
     pub mdns_discovery_handler: RefCell<Option<glib::SignalHandlerId>>,
     /// Long-lived clipboard-privacy modal. Kept alive (rather than
@@ -216,14 +224,9 @@ impl Window {
         {
             use crate::macos_privacy;
             if macos_privacy::accessibility_granted() {
-                // AX granted but the row is still visible => the daemon
-                // subprocess bailed before AX was in place and needs a
-                // fresh process. Quit + relaunch via Launch Services.
-                log::info!("capture row clicked in relaunch-required state");
-                macos_privacy::relaunch_bundle();
-                if let Some(app) = self.obj().application() {
-                    app.quit();
-                }
+                // The Agent owns the Core and all GUI processes. It must
+                // release them before starting a fresh permission session.
+                self.obj().request(mousehop_ipc::FrontendRequest::Restart);
                 return;
             }
             log::info!("capture row clicked in AX-missing state, opening pane");
@@ -300,6 +303,26 @@ impl ObjectImpl for Window {
         }
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);
+        let weak = self.obj().downgrade();
+        self.sharing_switch.connect_active_notify(move |switch| {
+            if let Some(window) = weak.upgrade() {
+                if !window.imp().runtime_update.get() {
+                    window.request(mousehop_ipc::FrontendRequest::SetSharing(
+                        switch.is_active(),
+                    ));
+                }
+            }
+        });
+        let weak = self.obj().downgrade();
+        self.autostart_switch.connect_active_notify(move |switch| {
+            if let Some(window) = weak.upgrade() {
+                if !window.imp().runtime_update.get() {
+                    window.request(mousehop_ipc::FrontendRequest::SetAutostart(
+                        switch.is_active(),
+                    ));
+                }
+            }
+        });
         self.language_row
             .set_selected(crate::i18n::preference().index());
         let weak = self.obj().downgrade();

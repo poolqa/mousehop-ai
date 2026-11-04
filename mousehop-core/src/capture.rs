@@ -79,6 +79,7 @@ pub(crate) enum CaptureType {
 
 #[derive(Debug)]
 enum CaptureRequest {
+    Pause(oneshot::Sender<()>),
     /// release because the remote peer is taking over (they sent
     /// Enter+CursorPos). Skips the host-side warp so the peer's
     /// proportional CursorPos warp doesn't get clobbered by a
@@ -120,6 +121,7 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let forwarding = Rc::new(Cell::new(false));
         let capture_task = CaptureTask {
+            pause_completion: None,
             forwarding: forwarding.clone(),
             active_client: None,
             active_session: None,
@@ -155,6 +157,13 @@ impl Capture {
             request_tx,
             task,
             event_rx,
+        }
+    }
+
+    pub(crate) async fn pause(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.request_tx.send(CaptureRequest::Pause(tx)).is_ok() {
+            let _ = rx.await;
         }
     }
 
@@ -385,12 +394,25 @@ impl CommandCtrlMapper {
                 latched,
                 locked,
                 group,
-            }) => Some(Event::Keyboard(KeyboardEvent::Modifiers {
-                depressed: command_mask_as_ctrl(depressed),
-                latched: command_mask_as_ctrl(latched),
-                locked: command_mask_as_ctrl(locked),
-                group,
-            })),
+            }) => {
+                // A later snapshot may repair a key-up lost before this
+                // mapper. Clear the physical aliases too, or the next
+                // Command/Ctrl press can be mistaken for an old held key.
+                for side in [&mut self.left, &mut self.right] {
+                    if (depressed | latched) & CONTROL_MASK == 0 {
+                        side.physical_ctrl_down = false;
+                    }
+                    if (depressed | latched) & MOD4_MASK == 0 {
+                        side.physical_command_down = false;
+                    }
+                }
+                Some(Event::Keyboard(KeyboardEvent::Modifiers {
+                    depressed: command_mask_as_ctrl(depressed),
+                    latched: command_mask_as_ctrl(latched),
+                    locked: command_mask_as_ctrl(locked),
+                    group,
+                }))
+            }
             other => Some(other),
         }
     }
@@ -575,6 +597,7 @@ struct CaptureRegistration {
 }
 
 struct CaptureTask {
+    pause_completion: Option<oneshot::Sender<()>>,
     forwarding: Rc<Cell<bool>>,
     active_client: Option<CaptureHandle>,
     /// DTLS generation that owns `active_client`. Every event after Begin is
@@ -954,9 +977,13 @@ impl CaptureTask {
             if let Err(e) = self.do_capture().await {
                 log::warn!("input capture exited: {e}");
             }
+            if let Some(completion) = self.pause_completion.take() {
+                let _ = completion.send(());
+            }
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
+                        CaptureRequest::Pause(completion) => { let _ = completion.send(()); },
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t, command_as_ctrl, crossing_modifier) => {
                             self.add_capture(h, p, t, command_as_ctrl, crossing_modifier)
@@ -1381,6 +1408,7 @@ impl CaptureTask {
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
+                    CaptureRequest::Pause(completion) => { self.pause_completion = Some(completion); return Ok(()); },
                     CaptureRequest::Reenable => {
                         // Capture is already running, so there is
                         // nothing to restart — but "re-enable" is also
@@ -2184,6 +2212,7 @@ mod command_ctrl_tests {
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         CaptureTask {
+            pause_completion: None,
             forwarding: Rc::new(Cell::new(active_client.is_some())),
             active_client,
             active_session: active_client.map(|_| 11),
@@ -2482,6 +2511,26 @@ mod command_ctrl_tests {
             locked: 0,
             group: 0,
         })
+    }
+
+    #[test]
+    fn repaired_modifier_snapshot_rearms_command_alias_for_the_next_shortcut() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        // The Command-up was missing, but the later click reports no modifiers.
+        assert_eq!(mapper.transform(modifiers(0)), Some(modifiers(0)));
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 0)),
+            Some(key(KeyLeftCtrl, 0))
+        );
     }
 
     #[test]

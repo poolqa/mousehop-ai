@@ -82,6 +82,7 @@ pub(crate) struct OutgoingPayload {
     total_bytes: u64,
     items: Arc<Vec<PayloadItem>>,
     _lease: Option<ClipboardFileLease>,
+    _archive_lease: Option<ClipboardFileLease>,
 }
 
 impl OutgoingPayload {
@@ -120,6 +121,7 @@ impl OutgoingPayload {
                 source: Some(PayloadSource::Bytes(Arc::new(bytes))),
             }]),
             _lease: None,
+            _archive_lease: None,
         };
         value.validate()?;
         Ok(value)
@@ -128,12 +130,17 @@ impl OutgoingPayload {
     pub(crate) fn file_tree(
         paths: Vec<PathBuf>,
         lease: Option<ClipboardFileLease>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Self, BulkTransportError> {
         if paths.is_empty() {
             return Err(BulkTransportError::InvalidPayload(
                 "file list is empty".into(),
             ));
         }
+        #[cfg(target_os = "macos")]
+        let (paths, archive_lease) = crate::clipboard_bundle::prepare(paths, cancel)?;
+        #[cfg(not(target_os = "macos"))]
+        let archive_lease = None;
         let mut items = Vec::new();
         let mut relative_paths = HashSet::new();
         let mut total_bytes = 0_u64;
@@ -145,6 +152,13 @@ impl OutgoingPayload {
                     BulkTransportError::InvalidPayload(format!("invalid clipboard path: {root:?}"))
                 })?;
             for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+                if cancel.is_cancelled() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "File copy cancelled",
+                    )
+                    .into());
+                }
                 let entry =
                     entry.map_err(|error| BulkTransportError::InvalidPayload(error.to_string()))?;
                 if entry.file_type().is_symlink() {
@@ -218,6 +232,7 @@ impl OutgoingPayload {
             total_bytes,
             items: Arc::new(items),
             _lease: lease,
+            _archive_lease: archive_lease,
         };
         value.validate()?;
         Ok(value)
@@ -746,7 +761,12 @@ mod tests {
         let root = staging.path().join("folder");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("hello.txt"), b"hello").unwrap();
-        let payload = OutgoingPayload::file_tree(vec![root], None).unwrap();
+        let payload = OutgoingPayload::file_tree(
+            vec![root],
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(payload.kind, ClipboardItemKind::FileTree);
         assert_eq!(payload.total_bytes, 5);
         let entries: Vec<_> = payload
@@ -766,7 +786,11 @@ mod tests {
         std::fs::write(&first_file, b"one").unwrap();
         std::fs::write(&second_file, b"two").unwrap();
         assert!(matches!(
-            OutgoingPayload::file_tree(vec![first_file, second_file], None),
+            OutgoingPayload::file_tree(
+                vec![first_file, second_file],
+                None,
+                &tokio_util::sync::CancellationToken::new()
+            ),
             Err(BulkTransportError::InvalidPayload(_))
         ));
     }

@@ -28,6 +28,8 @@ pub const MACOS_KEEP_AWAKE_EVENT_TAG: i64 = 0x4d4f_5553_4548_4f50;
 
 /// Identifies Mousehop's own Windows SendInput events in low-level hooks.
 pub const WINDOWS_INPUT_EVENT_TAG: usize = 0x4d48_4f50;
+/// Absolute cursor landing must not be interpreted as a new edge crossing.
+pub const WINDOWS_POINTER_WARP_TAG: usize = 0x4d48_5750;
 
 /// Quartz events delivered to the receiving machine, including native-menu
 /// cancellation. These must not be captured and forwarded to another peer.

@@ -117,7 +117,11 @@ fix_references() {
   done
 }
 
-fix_references "$exec_path"
+for bundle_exec in "$(dirname "$exec_path")"/*; do
+  if [ -f "$bundle_exec" ] && [ -x "$bundle_exec" ]; then
+    fix_references "$bundle_exec"
+  fi
+done
 
 # Also inspect libraries already present from an earlier invocation. The
 # recursion above intentionally skips an existing destination to avoid cycles;
@@ -182,11 +186,16 @@ for required_resource in icon.icns menubar-template.png; do
   fi
 done
 
-# Ensure the main executable has our Frameworks path in its RPATH
-if ! otool -l "$exec_path" | grep -q "@executable_path/../Frameworks"; then
-  echo "Adding RPATH to $exec_path"
-  install_name_tool -add_rpath "@executable_path/../Frameworks" "$exec_path"
-fi
+# Each helper is a separate dyld entry point; it cannot inherit the Agent's
+# LC_RPATH. Rewriting its imports to @rpath is insufficient without this path.
+for bundle_exec in "$(dirname "$exec_path")"/*; do
+  if [ -f "$bundle_exec" ] && [ -x "$bundle_exec" ]; then
+    if ! otool -l "$bundle_exec" | grep -q "@executable_path/../Frameworks"; then
+      echo "Adding RPATH to $bundle_exec"
+      install_name_tool -add_rpath "@executable_path/../Frameworks" "$bundle_exec"
+    fi
+  fi
+done
 
 # Se-sign the .app
 codesign --force --deep --sign - "$bundle_path"
@@ -195,6 +204,11 @@ codesign --force --deep --sign - "$bundle_path"
 # before the GUI or daemon starts, but a missing transitive dylib still makes
 # this command fail and prevents a broken bundle from being released.
 echo "Verifying bundled executable dependencies..."
-"$exec_path" --version >/dev/null
+for bundle_exec in "$(dirname "$exec_path")"/*; do
+  if [ -f "$bundle_exec" ] && [ -x "$bundle_exec" ]; then
+    echo "Verifying $(basename "$bundle_exec")"
+    "$bundle_exec" --version >/dev/null
+  fi
+done
 
 echo "Done!"
