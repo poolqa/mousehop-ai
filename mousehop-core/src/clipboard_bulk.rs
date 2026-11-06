@@ -778,6 +778,36 @@ mod tests {
     }
 
     #[test]
+    fn large_file_metadata_reaches_receiver_without_truncation() {
+        let staging = tempfile::tempdir().unwrap();
+        let path = staging.path().join("large.bin");
+        let size = (5_u64 << 30) + 17;
+        std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+        let payload = OutgoingPayload::file_tree(
+            vec![path],
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(payload.total_bytes, size);
+        let offer = ClipboardOffer {
+            transfer_id: TransferId([9; 16]),
+            origin_fingerprint: "test".into(),
+            kind: payload.kind,
+            total_bytes: payload.total_bytes,
+            item_count: payload.items.len() as u32,
+            image_width: 0,
+            image_height: 0,
+        };
+        let mut receiver =
+            crate::clipboard_receive::TransferStager::new(offer, TransferLimits::default())
+                .unwrap();
+        let manifest = payload.items[0].manifest.clone().unwrap();
+        assert_eq!(manifest.size, size);
+        receiver.apply(BulkFrame::Manifest(manifest)).unwrap();
+    }
+
+    #[test]
     fn file_payload_rejects_duplicate_top_level_names() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();

@@ -619,11 +619,14 @@ Defaults are `false`. Text and image sync retain their existing behavior.
 ### Limitations
 
 - Current peers negotiate clipboard-v2 and send text up to **32 MiB**, lossless
-  PNG images up to **128 MiB** (with decoded pixel limits), and file trees up to
-  **2 GiB / 10,000 entries** over a
+  PNG images up to **128 MiB** (with decoded pixel limits), and file trees with
+  **no application byte-size cap / 10,000 entries** over a
   separately authenticated, encrypted TCP stream. Mouse/keyboard traffic stays
   on DTLS and is not queued behind the copy. Legacy peers retain the **4 KiB**
   DTLS text limit; larger copies are skipped for those peers.
+  File data streams in chunks of at most 256 KiB with 64-bit sizes and offsets;
+  available disk space and filesystem limits still apply. Both peers must be
+  updated to remove the former 2 GiB file-transfer limit.
 - File contents are sent only when you paste on the receiving computer. Copy
   files normally in Explorer/Finder, then use **Ctrl+V / Shift+Insert** in
   Windows Explorer or **Command+V** in Finder, or choose the regular **Paste**

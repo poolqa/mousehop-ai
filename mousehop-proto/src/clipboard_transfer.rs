@@ -33,7 +33,8 @@ impl Default for TransferLimits {
         Self {
             max_text_bytes: 32 * 1024 * 1024,
             max_image_bytes: 128 * 1024 * 1024,
-            max_file_tree_bytes: 2 * 1024 * 1024 * 1024,
+            // Files stream to disk; their total size does not reserve memory.
+            max_file_tree_bytes: u64::MAX,
             max_file_entries: MAX_CLIPBOARD_MANIFEST_ENTRIES,
             max_image_pixels: 100_000_000,
         }
@@ -577,6 +578,25 @@ mod tests {
         value.total_bytes = TransferLimits::default().max_text_bytes + 1;
         assert!(matches!(
             value.validate_against(TransferLimits::default()),
+            Err(ClipboardTransferError::TransferTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn file_offers_have_no_application_size_cap() {
+        let mut value = offer(ClipboardItemKind::FileTree);
+        for size in [7_u64 * 1024 * 1024 * 1024 / 2, 5_u64 << 30, u64::MAX] {
+            value.total_bytes = size;
+            let decoded = ClipboardOffer::decode(&value.encode().unwrap()).unwrap();
+            decoded.validate_against(TransferLimits::default()).unwrap();
+            assert_eq!(decoded.total_bytes, size);
+        }
+        let limits = TransferLimits {
+            max_file_tree_bytes: 1024,
+            ..TransferLimits::default()
+        };
+        assert!(matches!(
+            value.validate_against(limits),
             Err(ClipboardTransferError::TransferTooLarge { .. })
         ));
     }
